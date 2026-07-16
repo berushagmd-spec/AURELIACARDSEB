@@ -55,7 +55,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 MAIN_ADMIN_ID = 7787565361
 
 # Версии ведём в формате MAJOR.MINOR.PATCH
-BOT_VERSION = "1.1.0"
+BOT_VERSION = "1.1.1"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 STICKER_SET_NAME = "AureliaPack"
@@ -446,6 +446,23 @@ def flag_choice_keyboard(prefix: str, allow_none: bool = False):
     return InlineKeyboardMarkup(buttons)
 
 
+async def build_flag_input_file(
+    context: ContextTypes.DEFAULT_TYPE,
+    entry: dict,
+    default_extension: str,
+):
+    telegram_file = await context.bot.get_file(entry["flag_file_id"])
+    file_bytes = await telegram_file.download_as_bytearray()
+    extension = os.path.splitext(telegram_file.file_path or "")[1].lower()
+    if not extension or len(extension) > 5:
+        extension = default_extension
+    safe_name = "".join(
+        char if char.isalnum() or char in (" ", "-", "_") else "_"
+        for char in entry["country_name"]
+    ).strip() or "flag"
+    return InputFile(bytes(file_bytes), filename=f"{safe_name}{extension}")
+
+
 def clear_region_context(context: ContextTypes.DEFAULT_TYPE):
     for key in (
         "region_country_id",
@@ -722,23 +739,43 @@ async def cb_show_library_flag(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.message.reply_text("Похоже, этого флага уже нет")
         return
 
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton(
-                "Скинуть без сжатия",
-                callback_data=f"downloadflag:{entry['id']}",
-            )
-        ]]
-    )
     caption = f'Флаг {entry["country_name"]}'
     if entry.get("flag_media_type") == "photo":
+        kb = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "Скинуть файлом",
+                    callback_data=f"downloadflag:{entry['id']}",
+                )
+            ]]
+        )
         await query.message.reply_photo(
             photo=entry["flag_file_id"], caption=caption, reply_markup=kb
         )
     else:
-        await query.message.reply_document(
-            document=entry["flag_file_id"], caption=caption, reply_markup=kb
+        kb = InlineKeyboardMarkup(
+            [[
+                InlineKeyboardButton(
+                    "Скинуть оригинал без сжатия",
+                    callback_data=f"downloadflag:{entry['id']}",
+                )
+            ]]
         )
+        try:
+            preview = await build_flag_input_file(context, entry, ".png")
+            await query.message.reply_photo(
+                photo=preview, caption=caption, reply_markup=kb
+            )
+        except Exception as error:
+            logger.warning(
+                "Не удалось сделать фото-превью для флага %s: %s",
+                entry["country_name"],
+                error,
+            )
+            await query.message.reply_document(
+                document=entry["flag_file_id"],
+                caption=f"{caption}\n\nПревью не получилось, поэтому сразу скинул оригинал",
+            )
 
 
 async def cb_download_library_flag(
@@ -751,21 +788,19 @@ async def cb_download_library_flag(
     if not entry:
         await query.message.reply_text("Похоже, этого флага уже нет")
         return
-    caption = f'Флаг {entry["country_name"]} без сжатия'
     if entry.get("flag_media_type") == "photo":
-        telegram_file = await context.bot.get_file(entry["flag_file_id"])
-        file_bytes = await telegram_file.download_as_bytearray()
-        safe_name = "".join(
-            char if char.isalnum() or char in (" ", "-", "_") else "_"
-            for char in entry["country_name"]
-        ).strip() or "flag"
+        file_to_send = await build_flag_input_file(context, entry, ".jpg")
         await query.message.reply_document(
-            document=InputFile(bytes(file_bytes), filename=f"{safe_name}.jpg"),
-            caption=caption,
+            document=file_to_send,
+            caption=(
+                f'Флаг {entry["country_name"]} файлом\n\n'
+                "Изначально его загрузили как фото, поэтому несжатого оригинала у бота нет"
+            ),
         )
     else:
         await query.message.reply_document(
-            document=entry["flag_file_id"], caption=caption
+            document=entry["flag_file_id"],
+            caption=f'Оригинал флага {entry["country_name"]} без сжатия',
         )
 
 
