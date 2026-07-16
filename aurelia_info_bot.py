@@ -28,6 +28,7 @@ from telegram import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    InputFile,
 )
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -52,6 +53,9 @@ logger = logging.getLogger("aurelia_bot")
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 MAIN_ADMIN_ID = 7787565361
+
+# Версии ведём в формате MAJOR.MINOR.PATCH
+BOT_VERSION = "1.1.0"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 STICKER_SET_NAME = "AureliaPack"
@@ -90,6 +94,10 @@ def load_data():
                 for field in ("leader", "capital", "description"):
                     if isinstance(country.get(field), str):
                         country[field] = normalize_user_text(country[field])
+                if country.get("flag_file_id"):
+                    country["flag_media_type"] = (
+                        country.get("flag_media_type") or "document"
+                    )
                 for field in ("continents", "lore_links"):
                     if isinstance(country.get(field), list):
                         country[field] = [
@@ -180,6 +188,9 @@ def load_data():
                         "id": entry_id,
                         "country_name": country_name,
                         "flag_file_id": entry["flag_file_id"],
+                        "flag_media_type": (
+                            entry.get("flag_media_type") or "document"
+                        ),
                     }
                 )
             d["flag_library"] = flag_library
@@ -343,6 +354,98 @@ def library_flag_name_exists(name: str, exclude_id=None) -> bool:
     )
 
 
+def find_library_flag_by_name(name: str):
+    wanted = name.casefold()
+    for entry in DATA.get("flag_library", []):
+        if entry.get("country_name", "").casefold() == wanted:
+            return entry
+    return None
+
+
+def upsert_library_flag(
+    name: str, file_id: str, media_type: str = "document"
+) -> bool:
+    """Добавляет флаг в библиотеку или обновляет одноимённый."""
+    if not file_id:
+        return False
+
+    name = normalize_user_text(name.strip())
+    media_type = media_type if media_type in ("document", "photo") else "document"
+    entry = find_library_flag_by_name(name)
+    if entry:
+        changed = any(
+            (
+                entry.get("country_name") != name,
+                entry.get("flag_file_id") != file_id,
+                entry.get("flag_media_type", "document") != media_type,
+            )
+        )
+        entry["country_name"] = name
+        entry["flag_file_id"] = file_id
+        entry["flag_media_type"] = media_type
+        return changed
+
+    DATA.setdefault("flag_library", []).append(
+        {
+            "id": uuid4().hex[:12],
+            "country_name": name,
+            "flag_file_id": file_id,
+            "flag_media_type": media_type,
+        }
+    )
+    return True
+
+
+def region_library_flag_name(country_name: str, region_name: str) -> str:
+    return f"{region_name} - {country_name}"
+
+
+def sync_entity_flags_to_library() -> bool:
+    """Подтягивает в библиотеку флаги всех уже сохранённых стран и регионов."""
+    changed = False
+    for country_name, country in DATA.get("countries", {}).items():
+        if country.get("flag_file_id"):
+            changed = upsert_library_flag(
+                country_name,
+                country["flag_file_id"],
+                country.get("flag_media_type", "document"),
+            ) or changed
+
+        for region in country.get("regions", []):
+            if not region.get("flag_file_id"):
+                continue
+            changed = upsert_library_flag(
+                region_library_flag_name(country_name, region["name"]),
+                region["flag_file_id"],
+                region.get("flag_media_type", "document"),
+            ) or changed
+    return changed
+
+
+def flag_choice_keyboard(prefix: str, allow_none: bool = False):
+    buttons = [
+        [InlineKeyboardButton("Загрузить новый флаг", callback_data=f"{prefix}:new")]
+    ]
+    if allow_none:
+        buttons.append(
+            [InlineKeyboardButton("Без флага", callback_data=f"{prefix}:none")]
+        )
+
+    for entry in sorted(
+        DATA.get("flag_library", []),
+        key=lambda item: item["country_name"].casefold(),
+    ):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    f"Взять: {entry['country_name']}",
+                    callback_data=f"{prefix}:{entry['id']}",
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(buttons)
+
+
 def clear_region_context(context: ContextTypes.DEFAULT_TYPE):
     for key in (
         "region_country_id",
@@ -440,7 +543,8 @@ def build_info_text(c: dict) -> str:
         f"Столица: {escape(c.get('capital', '-'))}\n"
         f"Где находится: {escape(continents or '-')}\n\n"
         f"<b>Регионы:</b>\n{escape(region_names or '-')}\n\n"
-        f"<b>Немного о стране:</b>\n{escape(c.get('description', '-'))}\n\n"
+        f"<b>Немного о стране:</b>\n"
+        f"<blockquote expandable>{escape(c.get('description') or '-')}</blockquote>\n\n"
         f"Почитать лор:\n{escape(lore_text)}"
     )
     return text
@@ -452,7 +556,8 @@ def build_region_info_text(region: dict, country_name: str) -> str:
         f"<b>{escape(region['name'])}</b>\n\n"
         f"<b>Страна:</b> {escape(country_name)}\n"
         f"<b>Столица региона:</b> {escape(region.get('capital') or '-')}\n\n"
-        f"<b>Немного о регионе:</b>\n{escape(description)}"
+        f"<b>Немного о регионе:</b>\n"
+        f"<blockquote expandable>{escape(description)}</blockquote>"
     )
 
 
@@ -501,7 +606,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Привет! Это бот-путеводитель по Аурелии\n\n"
         "Тут можно полистать страны, посмотреть их флаги, гербы, регионы и лор. "
-        "Жми кнопку ниже и выбирай, куда заглянем",
+        "Жми кнопку ниже и выбирай, куда заглянем\n\n"
+        f'v: "{BOT_VERSION}"',
         reply_markup=kb,
     )
 
@@ -624,11 +730,15 @@ async def cb_show_library_flag(update: Update, context: ContextTypes.DEFAULT_TYP
             )
         ]]
     )
-    await query.message.reply_document(
-        document=entry["flag_file_id"],
-        caption=f'Флаг {entry["country_name"]}',
-        reply_markup=kb,
-    )
+    caption = f'Флаг {entry["country_name"]}'
+    if entry.get("flag_media_type") == "photo":
+        await query.message.reply_photo(
+            photo=entry["flag_file_id"], caption=caption, reply_markup=kb
+        )
+    else:
+        await query.message.reply_document(
+            document=entry["flag_file_id"], caption=caption, reply_markup=kb
+        )
 
 
 async def cb_download_library_flag(
@@ -641,10 +751,22 @@ async def cb_download_library_flag(
     if not entry:
         await query.message.reply_text("Похоже, этого флага уже нет")
         return
-    await query.message.reply_document(
-        document=entry["flag_file_id"],
-        caption=f'Флаг {entry["country_name"]} без сжатия',
-    )
+    caption = f'Флаг {entry["country_name"]} без сжатия'
+    if entry.get("flag_media_type") == "photo":
+        telegram_file = await context.bot.get_file(entry["flag_file_id"])
+        file_bytes = await telegram_file.download_as_bytearray()
+        safe_name = "".join(
+            char if char.isalnum() or char in (" ", "-", "_") else "_"
+            for char in entry["country_name"]
+        ).strip() or "flag"
+        await query.message.reply_document(
+            document=InputFile(bytes(file_bytes), filename=f"{safe_name}.jpg"),
+            caption=caption,
+        )
+    else:
+        await query.message.reply_document(
+            document=entry["flag_file_id"], caption=caption
+        )
 
 
 async def cb_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -655,7 +777,14 @@ async def cb_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Флаг куда-то запропастился", show_alert=True)
         return
     await query.answer()
-    await query.message.reply_document(document=c["flag_file_id"], caption=f"Флаг: {name}")
+    if c.get("flag_media_type") == "photo":
+        await query.message.reply_photo(
+            photo=c["flag_file_id"], caption=f"Флаг: {name}"
+        )
+    else:
+        await query.message.reply_document(
+            document=c["flag_file_id"], caption=f"Флаг: {name}"
+        )
 
 
 async def cb_herb(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -866,16 +995,53 @@ async def add_continent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     continents = [c.strip() for c in raw.split(",") if c.strip()]
     context.user_data["new_country"]["continents"] = continents
     await update.message.reply_text(
-        "Теперь скинь флаг. Лучше файлом, тогда Telegram его не пережмёт"
+        "Теперь выбери готовый флаг из библиотеки или загрузи новый",
+        reply_markup=flag_choice_keyboard("addcountryflag"),
     )
     return ADD_FLAG
+
+
+async def add_country_flag_choice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    country = context.user_data.get("new_country")
+    if not country:
+        await query.message.reply_text("Данные страны потерялись. Давай начнём заново")
+        return ConversationHandler.END
+
+    if choice == "new":
+        await query.message.reply_text(
+            "Скинь новый флаг. Лучше файлом, тогда Telegram его не пережмёт"
+        )
+        return ADD_FLAG
+
+    entry = find_library_flag(choice)
+    if not entry:
+        await query.message.reply_text(
+            "Похоже, этого флага уже нет. Выбери другой или загрузи новый",
+            reply_markup=flag_choice_keyboard("addcountryflag"),
+        )
+        return ADD_FLAG
+
+    country["flag_file_id"] = entry["flag_file_id"]
+    country["flag_media_type"] = entry.get("flag_media_type", "document")
+    await query.message.reply_text(
+        f'Взял флаг "{entry["country_name"]}" из библиотеки\n\n'
+        'Теперь герб. Лучше тоже файлом. Если герба нет, просто напиши "нет"'
+    )
+    return ADD_HERB
 
 
 async def add_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.document:
         file_id = update.message.document.file_id
+        media_type = "document"
     elif update.message.photo:
         file_id = update.message.photo[-1].file_id
+        media_type = "photo"
         await update.message.reply_text(
             "Флаг пришёл как обычное фото, так что Telegram мог его немного пережевать. "
             "В следующий раз лучше кидай файлом"
@@ -885,6 +1051,7 @@ async def add_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_FLAG
 
     context.user_data["new_country"]["flag_file_id"] = file_id
+    context.user_data["new_country"]["flag_media_type"] = media_type
     await update.message.reply_text(
         "Теперь герб. Лучше тоже файлом. Если герба нет, просто напиши \"нет\""
     )
@@ -932,6 +1099,11 @@ async def add_lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     c = context.user_data["new_country"]
     DATA["countries"][c["name"]] = c
+    upsert_library_flag(
+        c["name"],
+        c["flag_file_id"],
+        c.get("flag_media_type", "document"),
+    )
     save_data()
 
     await update.message.reply_text(f"Готово! Страна \"{c['name']}\" теперь в боте")
@@ -967,7 +1139,12 @@ add_country_conv = ConversationHandler(
         ADD_LEADER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_leader)],
         ADD_CAPITAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_capital)],
         ADD_CONTINENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_continent)],
-        ADD_FLAG: [MessageHandler(filters.PHOTO | filters.Document.IMAGE, add_flag)],
+        ADD_FLAG: [
+            CallbackQueryHandler(
+                add_country_flag_choice, pattern=r"^addcountryflag:"
+            ),
+            MessageHandler(filters.PHOTO | filters.Document.IMAGE, add_flag),
+        ],
         ADD_HERB: [
             MessageHandler(
                 (filters.PHOTO | filters.Document.IMAGE | filters.TEXT) & ~filters.COMMAND,
@@ -1052,8 +1229,10 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if field in ("card", "flag"):
         if update.message.document:
             file_id = update.message.document.file_id
+            media_type = "document"
         elif update.message.photo:
             file_id = update.message.photo[-1].file_id
+            media_type = "photo"
             await update.message.reply_text(
                 "Картинка пришла как фото, так что Telegram мог её немного сжать"
             )
@@ -1061,6 +1240,8 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Тут нужна именно картинка")
             return EDIT_VALUE
         c["card_file_id" if field == "card" else "flag_file_id"] = file_id
+        if field == "flag":
+            c["flag_media_type"] = media_type
 
     elif field == "herb":
         if update.message.text and update.message.text.strip().lower() in ("нет", "-", "no"):
@@ -1103,6 +1284,11 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:  # leader, capital
         c[field] = normalize_user_text(update.message.text.strip())
 
+    upsert_library_flag(
+        c["name"],
+        c.get("flag_file_id"),
+        c.get("flag_media_type", "document"),
+    )
     save_data()
     await update.message.reply_text("Готово, всё сохранил")
     context.user_data.pop("edit_country_name", None)
@@ -1227,13 +1413,18 @@ async def add_region_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["new_region_description"] = text
     await update.message.reply_text(
-        "Теперь можешь скинуть флаг региона файлом или фото. "
-        "Если флага нет, просто напиши \"нет\""
+        "Теперь выбери готовый флаг из библиотеки, загрузи новый или оставь регион без флага",
+        reply_markup=flag_choice_keyboard("addregionflag", allow_none=True),
     )
     return ADD_REGION_FLAG
 
 
-async def add_region_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def finish_add_region(
+    message,
+    context: ContextTypes.DEFAULT_TYPE,
+    file_id,
+    media_type,
+):
     country_id = context.user_data.get("region_country_id")
     country_name, country = get_country_by_id(country_id)
     region_name = context.user_data.get("new_region_name")
@@ -1244,6 +1435,61 @@ async def add_region_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_region_context(context)
         return ConversationHandler.END
 
+    region = {
+        "id": uuid4().hex[:12],
+        "name": region_name,
+        "capital": region_capital,
+        "description": region_description,
+        "flag_file_id": file_id,
+        "flag_media_type": media_type,
+    }
+    country.setdefault("regions", []).append(region)
+    if file_id:
+        upsert_library_flag(
+            region_library_flag_name(country_name, region_name),
+            file_id,
+            media_type or "document",
+        )
+    save_data()
+    await message.reply_text(
+        f'Готово! Регион "{region_name}" появился у страны "{country_name}"'
+    )
+    clear_region_context(context)
+    return ConversationHandler.END
+
+
+async def add_region_flag_choice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+
+    if choice == "new":
+        await query.message.reply_text(
+            "Скинь новый флаг региона файлом или фото"
+        )
+        return ADD_REGION_FLAG
+    if choice == "none":
+        return await finish_add_region(query.message, context, None, None)
+
+    entry = find_library_flag(choice)
+    if not entry:
+        await query.message.reply_text(
+            "Похоже, этого флага уже нет. Выбери другой или загрузи новый",
+            reply_markup=flag_choice_keyboard("addregionflag", allow_none=True),
+        )
+        return ADD_REGION_FLAG
+
+    return await finish_add_region(
+        query.message,
+        context,
+        entry["flag_file_id"],
+        entry.get("flag_media_type", "document"),
+    )
+
+
+async def add_region_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.text and update.message.text.strip().lower() in ("нет", "-", "no"):
         file_id = None
         media_type = None
@@ -1262,22 +1508,9 @@ async def add_region_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ADD_REGION_FLAG
 
-    country.setdefault("regions", []).append(
-        {
-            "id": uuid4().hex[:12],
-            "name": region_name,
-            "capital": region_capital,
-            "description": region_description,
-            "flag_file_id": file_id,
-            "flag_media_type": media_type,
-        }
+    return await finish_add_region(
+        update.message, context, file_id, media_type
     )
-    save_data()
-    await update.message.reply_text(
-        f'Готово! Регион "{region_name}" появился у страны "{country_name}"'
-    )
-    clear_region_context(context)
-    return ConversationHandler.END
 
 
 add_region_conv = ConversationHandler(
@@ -1298,6 +1531,9 @@ add_region_conv = ConversationHandler(
             MessageHandler(filters.TEXT & ~filters.COMMAND, add_region_desc)
         ],
         ADD_REGION_FLAG: [
+            CallbackQueryHandler(
+                add_region_flag_choice, pattern=r"^addregionflag:"
+            ),
             MessageHandler(
                 (filters.TEXT | filters.PHOTO | filters.Document.IMAGE)
                 & ~filters.COMMAND,
@@ -1461,7 +1697,7 @@ async def edit_region_choose_field(
 
 async def edit_region_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country_id = context.user_data.get("region_country_id")
-    _, country = get_country_by_id(country_id)
+    country_name, country = get_country_by_id(country_id)
     region = find_region(country, context.user_data.get("edit_region_id"))
     field = context.user_data.get("edit_region_field")
     if not country or not region:
@@ -1541,6 +1777,12 @@ async def edit_region_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         clear_region_context(context)
         return ConversationHandler.END
 
+    if region.get("flag_file_id"):
+        upsert_library_flag(
+            region_library_flag_name(country_name, region["name"]),
+            region["flag_file_id"],
+            region.get("flag_media_type", "document"),
+        )
     save_data()
     await update.message.reply_text("Готово, регион обновил")
     clear_region_context(context)
@@ -1655,6 +1897,7 @@ async def quick_add_library_flag(
             "id": uuid4().hex[:12],
             "country_name": name,
             "flag_file_id": update.message.document.file_id,
+            "flag_media_type": "document",
         }
     )
     save_data()
@@ -1718,6 +1961,7 @@ async def add_library_flag_file(
             "id": uuid4().hex[:12],
             "country_name": name,
             "flag_file_id": update.message.document.file_id,
+            "flag_media_type": "document",
         }
     )
     save_data()
@@ -1861,6 +2105,7 @@ async def edit_library_flag_value(
             await update.message.reply_text("Флаг нужно отправить именно файлом")
             return EDIT_LIBRARY_FLAG_VALUE
         entry["flag_file_id"] = update.message.document.file_id
+        entry["flag_media_type"] = "document"
     else:
         await update.message.reply_text("Не понял, что менять")
         clear_library_flag_context(context)
@@ -1957,6 +2202,9 @@ def admin_commands():
 
 
 async def post_init(application: Application):
+    if sync_entity_flags_to_library():
+        save_data()
+
     await application.bot.set_my_commands(public_commands(), scope=BotCommandScopeDefault())
     try:
         await application.bot.set_my_commands(
@@ -2028,7 +2276,7 @@ def main():
         CallbackQueryHandler(cb_download_library_flag, pattern=r"^downloadflag:")
     )
 
-    logger.info("АУРЕЛИЯ INFO BOT запущен.")
+    logger.info('АУРЕЛИЯ INFO BOT запущен, v: "%s"', BOT_VERSION)
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
