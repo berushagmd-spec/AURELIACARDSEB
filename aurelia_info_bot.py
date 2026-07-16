@@ -75,6 +75,7 @@ def load_data():
             d = json.load(f)
             d.setdefault("admins", [])
             d.setdefault("countries", {})
+            d.setdefault("flag_library", [])
 
             # Сразу приводим старые тексты к обычному дефису и прямым
             # кавычкам, чтобы старое оформление не возвращалось из data.json.
@@ -134,6 +135,12 @@ def load_data():
                         {
                             "id": region_id,
                             "name": name,
+                            "capital": normalize_user_text(
+                                str(region.get("capital") or "").strip()
+                            ),
+                            "description": normalize_user_text(
+                                str(region.get("description") or "").strip()
+                            ),
                             "flag_file_id": region.get("flag_file_id"),
                             "flag_media_type": region.get("flag_media_type")
                             or (
@@ -144,8 +151,40 @@ def load_data():
                         }
                     )
                 country["regions"] = regions
+
+            raw_library = d.get("flag_library", [])
+            if isinstance(raw_library, dict):
+                raw_library = [
+                    {"country_name": name, "flag_file_id": file_id}
+                    for name, file_id in raw_library.items()
+                ]
+            if not isinstance(raw_library, list):
+                raw_library = []
+
+            flag_library = []
+            used_flag_ids = set()
+            for entry in raw_library:
+                if not isinstance(entry, dict) or not entry.get("flag_file_id"):
+                    continue
+                country_name = normalize_user_text(
+                    str(entry.get("country_name") or entry.get("name") or "").strip()
+                )
+                if not country_name:
+                    continue
+                entry_id = str(entry.get("id", "")).strip()
+                while not entry_id or entry_id in used_flag_ids:
+                    entry_id = uuid4().hex[:12]
+                used_flag_ids.add(entry_id)
+                flag_library.append(
+                    {
+                        "id": entry_id,
+                        "country_name": country_name,
+                        "flag_file_id": entry["flag_file_id"],
+                    }
+                )
+            d["flag_library"] = flag_library
             return d
-    return {"admins": [], "countries": {}}
+    return {"admins": [], "countries": {}, "flag_library": []}
 
 
 def save_data():
@@ -176,9 +215,17 @@ def is_admin(user_id: int) -> bool:
     ADD_LORE,
 ) = range(9)
 
+SEARCH_COUNTRY_QUERY = 10
+
 (EDIT_CHOOSE_COUNTRY, EDIT_CHOOSE_FIELD, EDIT_VALUE) = range(20, 23)
 
-(ADD_REGION_CHOOSE_COUNTRY, ADD_REGION_NAME, ADD_REGION_FLAG) = range(30, 33)
+(
+    ADD_REGION_CHOOSE_COUNTRY,
+    ADD_REGION_NAME,
+    ADD_REGION_CAPITAL,
+    ADD_REGION_DESC,
+    ADD_REGION_FLAG,
+) = range(30, 35)
 
 (
     EDIT_REGION_CHOOSE_COUNTRY,
@@ -187,6 +234,15 @@ def is_admin(user_id: int) -> bool:
     EDIT_REGION_VALUE,
     EDIT_REGION_CONFIRM_DELETE,
 ) = range(40, 45)
+
+(ADD_LIBRARY_FLAG_NAME, ADD_LIBRARY_FLAG_FILE) = range(50, 52)
+
+(
+    EDIT_LIBRARY_FLAG_CHOOSE,
+    EDIT_LIBRARY_FLAG_FIELD,
+    EDIT_LIBRARY_FLAG_VALUE,
+    EDIT_LIBRARY_FLAG_CONFIRM_DELETE,
+) = range(60, 64)
 
 EDIT_FIELDS = {
     "name": "Название",
@@ -229,6 +285,30 @@ def get_country_by_id(country_id: str):
     return None, None
 
 
+def search_countries(search_text: str):
+    wanted = normalize_user_text(search_text.strip()).casefold()
+    if not wanted:
+        return []
+    matches = []
+    for name, country in DATA["countries"].items():
+        capital = country.get("capital") or ""
+        if wanted in name.casefold() or wanted in capital.casefold():
+            matches.append((name, country))
+    return sorted(matches, key=lambda item: item[0].casefold())
+
+
+def search_results_keyboard(matches):
+    buttons = [
+        [
+            InlineKeyboardButton(
+                name, callback_data=f"searchcountry:{country['id']}"
+            )
+        ]
+        for name, country in matches
+    ]
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
 def find_region(country: dict, region_id: str):
     if not country:
         return None
@@ -247,12 +327,39 @@ def region_name_exists(country: dict, name: str, exclude_id=None) -> bool:
     )
 
 
+def find_library_flag(entry_id: str):
+    for entry in DATA.get("flag_library", []):
+        if entry.get("id") == entry_id:
+            return entry
+    return None
+
+
+def library_flag_name_exists(name: str, exclude_id=None) -> bool:
+    wanted = name.casefold()
+    return any(
+        entry.get("id") != exclude_id
+        and entry.get("country_name", "").casefold() == wanted
+        for entry in DATA.get("flag_library", [])
+    )
+
+
 def clear_region_context(context: ContextTypes.DEFAULT_TYPE):
     for key in (
         "region_country_id",
         "new_region_name",
+        "new_region_capital",
+        "new_region_description",
         "edit_region_id",
         "edit_region_field",
+    ):
+        context.user_data.pop(key, None)
+
+
+def clear_library_flag_context(context: ContextTypes.DEFAULT_TYPE):
+    for key in (
+        "new_library_flag_name",
+        "edit_library_flag_id",
+        "edit_library_flag_field",
     ):
         context.user_data.pop(key, None)
 
@@ -282,7 +389,7 @@ async def send_random_country_sticker(
         logger.warning("Не удалось отправить случайный стикер: %s", e)
 
 
-def regions_keyboard(country: dict, prefix="regionflag"):
+def regions_keyboard(country: dict, prefix="regioninfo"):
     buttons = [
         [
             InlineKeyboardButton(
@@ -297,10 +404,30 @@ def regions_keyboard(country: dict, prefix="regionflag"):
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
+def flag_library_keyboard(prefix="libraryflag"):
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"Флаг {entry['country_name']}",
+                callback_data=f"{prefix}:{entry['id']}",
+            )
+        ]
+        for entry in sorted(
+            DATA.get("flag_library", []),
+            key=lambda item: item["country_name"].casefold(),
+        )
+    ]
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
 def build_info_text(c: dict) -> str:
     continents = ", ".join(c.get("continents", []))
     region_names = "\n\n".join(
-        region["name"]
+        (
+            f"{region['name']} ({region['capital']})"
+            if region.get("capital")
+            else region["name"]
+        )
         for region in sorted(
             c.get("regions", []), key=lambda item: item["name"].casefold()
         )
@@ -309,14 +436,37 @@ def build_info_text(c: dict) -> str:
     lore_text = "\n\n".join(lore) if lore else "-"
     text = (
         f"<b>{escape(c['name'])}</b>\n\n"
-        f"Кто у руля: {escape(c.get('leader', '-'))}\n"
+        f"<b>Кто у руля:</b> {escape(c.get('leader', '-'))}\n"
         f"Столица: {escape(c.get('capital', '-'))}\n"
         f"Где находится: {escape(continents or '-')}\n\n"
-        f"Регионы:\n{escape(region_names or '-')}\n\n"
-        f"Немного о стране:\n{escape(c.get('description', '-'))}\n\n"
+        f"<b>Регионы:</b>\n{escape(region_names or '-')}\n\n"
+        f"<b>Немного о стране:</b>\n{escape(c.get('description', '-'))}\n\n"
         f"Почитать лор:\n{escape(lore_text)}"
     )
     return text
+
+
+def build_region_info_text(region: dict, country_name: str) -> str:
+    description = region.get("description") or "-"
+    return (
+        f"<b>{escape(region['name'])}</b>\n\n"
+        f"<b>Страна:</b> {escape(country_name)}\n"
+        f"<b>Столица региона:</b> {escape(region.get('capital') or '-')}\n\n"
+        f"<b>Немного о регионе:</b>\n{escape(description)}"
+    )
+
+
+def region_info_buttons(country: dict, region: dict):
+    if not region.get("flag_file_id"):
+        return None
+    return InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "🚩 Флаг",
+                callback_data=f"regionflag:{country['id']}:{region['id']}",
+            )
+        ]]
+    )
 
 
 def info_buttons(c: dict):
@@ -342,7 +492,11 @@ def info_buttons(c: dict):
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup(
-        [[InlineKeyboardButton("📋 Список стран", callback_data="list_countries")]]
+        [
+            [InlineKeyboardButton("📋 Список стран", callback_data="list_countries")],
+            [InlineKeyboardButton("🔎 Поиск страны", callback_data="search_countries")],
+            [InlineKeyboardButton("Библиотека флагов", callback_data="list_library_flags")],
+        ]
     )
     await update.message.reply_text(
         "Привет! Это бот-путеводитель по Аурелии\n\n"
@@ -370,6 +524,20 @@ async def cb_list_countries(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.message.reply_text("Выбирай страну:", reply_markup=kb)
 
 
+async def send_country_details(message, context, name: str, country: dict):
+    await send_random_country_sticker(message, context)
+    await message.reply_photo(
+        photo=country["card_file_id"],
+        caption=f"<b>{escape(name)}</b>",
+        parse_mode=ParseMode.HTML,
+    )
+    await message.reply_text(
+        build_info_text(country),
+        parse_mode=ParseMode.HTML,
+        reply_markup=info_buttons(country),
+    )
+
+
 async def cb_show_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -378,16 +546,104 @@ async def cb_show_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not c:
         await query.message.reply_text("Похоже, этой страны уже нет")
         return
+    await send_country_details(query.message, context, name, c)
 
-    # 1. Случайный стикер из официального набора Аурелии
-    await send_random_country_sticker(query.message, context)
 
-    # 2. Карточка
-    await query.message.reply_photo(photo=c["card_file_id"], caption=f"<b>{escape(name)}</b>", parse_mode=ParseMode.HTML)
+async def search_country_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.callback_query:
+        await update.callback_query.answer()
+    await update.effective_message.reply_text(
+        "Напиши название страны или её столицы"
+    )
+    return SEARCH_COUNTRY_QUERY
 
-    # 3. Отдельное сообщение с инфо и кнопками
-    await query.message.reply_text(
-        build_info_text(c), parse_mode=ParseMode.HTML, reply_markup=info_buttons(c)
+
+async def search_country_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    matches = search_countries(update.message.text)
+    if not matches:
+        await update.message.reply_text(
+            "Ничего не нашёл. Попробуй другое название"
+        )
+        return SEARCH_COUNTRY_QUERY
+
+    if len(matches) == 1:
+        name, country = matches[0]
+        await send_country_details(update.message, context, name, country)
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "Нашёл несколько вариантов. Выбирай:",
+        reply_markup=search_results_keyboard(matches),
+    )
+    return ConversationHandler.END
+
+
+async def cb_show_search_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    country_id = query.data.split(":", 1)[1]
+    name, country = get_country_by_id(country_id)
+    if not country:
+        await query.message.reply_text("Похоже, этой страны уже нет")
+        return
+    await send_country_details(query.message, context, name, country)
+
+
+async def cmd_flags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb = flag_library_keyboard()
+    if not kb:
+        await update.message.reply_text("Библиотека флагов пока пустая")
+        return
+    await update.message.reply_text("Выбирай флаг:", reply_markup=kb)
+
+
+async def cb_list_library_flags(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    kb = flag_library_keyboard()
+    if not kb:
+        await query.message.reply_text("Библиотека флагов пока пустая")
+        return
+    await query.message.reply_text("Выбирай флаг:", reply_markup=kb)
+
+
+async def cb_show_library_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    entry_id = query.data.split(":", 1)[1]
+    entry = find_library_flag(entry_id)
+    if not entry:
+        await query.message.reply_text("Похоже, этого флага уже нет")
+        return
+
+    kb = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton(
+                "Скинуть без сжатия",
+                callback_data=f"downloadflag:{entry['id']}",
+            )
+        ]]
+    )
+    await query.message.reply_document(
+        document=entry["flag_file_id"],
+        caption=f'Флаг {entry["country_name"]}',
+        reply_markup=kb,
+    )
+
+
+async def cb_download_library_flag(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    entry_id = query.data.split(":", 1)[1]
+    entry = find_library_flag(entry_id)
+    if not entry:
+        await query.message.reply_text("Похоже, этого флага уже нет")
+        return
+    await query.message.reply_document(
+        document=entry["flag_file_id"],
+        caption=f'Флаг {entry["country_name"]} без сжатия',
     )
 
 
@@ -429,8 +685,30 @@ async def cb_regions(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     await query.message.reply_text(
         f'Вот регионы страны "{name}"\n\n'
-        "Выбирай любой - если у него есть флаг, покажу",
+        "Выбирай любой - покажу его столицу, описание и флаг",
         reply_markup=kb,
+    )
+
+
+async def cb_region_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, region_id = query.data.split(":", 2)
+    except ValueError:
+        await query.message.reply_text("Эта кнопка почему-то сломалась")
+        return
+
+    country_name, country = get_country_by_id(country_id)
+    region = find_region(country, region_id)
+    if not country or not region:
+        await query.message.reply_text("Похоже, этого региона уже нет")
+        return
+
+    await query.message.reply_text(
+        build_region_info_text(region, country_name),
+        parse_mode=ParseMode.HTML,
+        reply_markup=region_info_buttons(country, region),
     )
 
 
@@ -475,8 +753,11 @@ async def cmd_admhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<b>Вот что можно делать через админ-команды:</b>\n\n"
         "/addcountry - добавить новую страну (пошагово)\n"
         "/editcountry - отредактировать существующую страну\n"
-        "/addregion - добавить регион и его флаг\n"
+        "/addregion - добавить регион\n"
         "/editregion - изменить или удалить регион\n"
+        "/addflag - добавить флаг в библиотеку\n"
+        "/editflag - изменить или удалить флаг из библиотеки\n"
+        "Также можно просто отправить флаг файлом и написать страну в подписи\n"
         "/addadmin &lt;user_id&gt; - добавить нового админа\n"
         "/admhelp - это сообщение\n"
         "/cancel - отменить текущий диалог добавления/редактирования"
@@ -662,6 +943,20 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Окей, всё отменил")
     return ConversationHandler.END
+
+
+search_country_conv = ConversationHandler(
+    entry_points=[
+        CommandHandler("search", search_country_start),
+        CallbackQueryHandler(search_country_start, pattern=r"^search_countries$"),
+    ],
+    states={
+        SEARCH_COUNTRY_QUERY: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, search_country_value)
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
 
 
 add_country_conv = ConversationHandler(
@@ -897,6 +1192,40 @@ async def add_region_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ADD_REGION_NAME
 
     context.user_data["new_region_name"] = name
+    await update.message.reply_text("Как называется столица региона?")
+    return ADD_REGION_CAPITAL
+
+
+async def add_region_capital(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    capital = normalize_user_text(update.message.text.strip())
+    if not capital:
+        await update.message.reply_text("Столица не может быть пустой")
+        return ADD_REGION_CAPITAL
+    if len(capital) > 100:
+        await update.message.reply_text(
+            f"Название столицы длинновато: {len(capital)} символов. Максимум 100"
+        )
+        return ADD_REGION_CAPITAL
+
+    context.user_data["new_region_capital"] = capital
+    await update.message.reply_text(
+        "Можешь добавить короткое описание региона. Максимум 500 символов. "
+        "Если описание не нужно, напиши \"нет\""
+    )
+    return ADD_REGION_DESC
+
+
+async def add_region_desc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = normalize_user_text(update.message.text.strip())
+    if text.casefold() in ("нет", "-", "no"):
+        text = ""
+    if len(text) > 500:
+        await update.message.reply_text(
+            f"Получилось {len(text)} символов, а можно максимум 500"
+        )
+        return ADD_REGION_DESC
+
+    context.user_data["new_region_description"] = text
     await update.message.reply_text(
         "Теперь можешь скинуть флаг региона файлом или фото. "
         "Если флага нет, просто напиши \"нет\""
@@ -908,7 +1237,9 @@ async def add_region_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
     country_id = context.user_data.get("region_country_id")
     country_name, country = get_country_by_id(country_id)
     region_name = context.user_data.get("new_region_name")
-    if not country or not region_name:
+    region_capital = context.user_data.get("new_region_capital")
+    region_description = context.user_data.get("new_region_description", "")
+    if not country or not region_name or not region_capital:
         await update.message.reply_text("Что-то потерялось по дороге. Я всё отменил")
         clear_region_context(context)
         return ConversationHandler.END
@@ -935,6 +1266,8 @@ async def add_region_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
         {
             "id": uuid4().hex[:12],
             "name": region_name,
+            "capital": region_capital,
+            "description": region_description,
             "flag_file_id": file_id,
             "flag_media_type": media_type,
         }
@@ -957,6 +1290,12 @@ add_region_conv = ConversationHandler(
         ],
         ADD_REGION_NAME: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, add_region_name)
+        ],
+        ADD_REGION_CAPITAL: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, add_region_capital)
+        ],
+        ADD_REGION_DESC: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, add_region_desc)
         ],
         ADD_REGION_FLAG: [
             MessageHandler(
@@ -1065,6 +1404,8 @@ async def edit_region_choose_region(
     context.user_data["edit_region_id"] = region_id
     buttons = [
         [InlineKeyboardButton("✏️ Название", callback_data="editregionfield:name")],
+        [InlineKeyboardButton("🏙 Столица", callback_data="editregionfield:capital")],
+        [InlineKeyboardButton("📝 Описание", callback_data="editregionfield:description")],
         [InlineKeyboardButton("🚩 Флаг", callback_data="editregionfield:flag")],
         [InlineKeyboardButton("🗑 Удалить", callback_data="editregionfield:delete")],
     ]
@@ -1081,7 +1422,7 @@ async def edit_region_choose_field(
     query = update.callback_query
     await query.answer()
     field = query.data.split(":", 1)[1]
-    if field not in ("name", "flag", "delete"):
+    if field not in ("name", "capital", "description", "flag", "delete"):
         await query.message.reply_text("Не понял, что нужно сделать. Давай начнём заново")
         clear_region_context(context)
         return ConversationHandler.END
@@ -1105,11 +1446,15 @@ async def edit_region_choose_field(
         return EDIT_REGION_CONFIRM_DELETE
 
     context.user_data["edit_region_field"] = field
-    prompt = (
-        "Как теперь будет называться регион?"
-        if field == "name"
-        else "Скинь новый флаг или напиши \"нет\", если флаг нужно убрать"
-    )
+    prompts = {
+        "name": "Как теперь будет называться регион?",
+        "capital": "Как теперь называется столица региона?",
+        "description": (
+            "Напиши новое описание региона или \"нет\", если его нужно убрать"
+        ),
+        "flag": "Скинь новый флаг или напиши \"нет\", если флаг нужно убрать",
+    }
+    prompt = prompts[field]
     await query.message.reply_text(prompt)
     return EDIT_REGION_VALUE
 
@@ -1143,6 +1488,35 @@ async def edit_region_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return EDIT_REGION_VALUE
         region["name"] = new_name
+
+    elif field == "capital":
+        if not update.message.text:
+            await update.message.reply_text("Столицу нужно прислать обычным текстом")
+            return EDIT_REGION_VALUE
+        capital = normalize_user_text(update.message.text.strip())
+        if not capital:
+            await update.message.reply_text("Столица не может быть пустой")
+            return EDIT_REGION_VALUE
+        if len(capital) > 100:
+            await update.message.reply_text(
+                f"Название столицы длинновато: {len(capital)} символов. Максимум 100"
+            )
+            return EDIT_REGION_VALUE
+        region["capital"] = capital
+
+    elif field == "description":
+        if not update.message.text:
+            await update.message.reply_text("Описание нужно прислать обычным текстом")
+            return EDIT_REGION_VALUE
+        description = normalize_user_text(update.message.text.strip())
+        if description.casefold() in ("нет", "-", "no"):
+            description = ""
+        if len(description) > 500:
+            await update.message.reply_text(
+                f"Получилось {len(description)} символов, а можно максимум 500"
+            )
+            return EDIT_REGION_VALUE
+        region["description"] = description
 
     elif field == "flag":
         if update.message.text and update.message.text.strip().lower() in ("нет", "-", "no"):
@@ -1235,6 +1609,327 @@ edit_region_conv = ConversationHandler(
 
 
 # ---------------------------------------------------------------------------
+# Библиотека флагов - добавление, редактирование и удаление
+# ---------------------------------------------------------------------------
+
+async def quick_add_library_flag(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        return
+    if not update.message.document or not update.message.caption:
+        return
+    if any(
+        key in context.user_data
+        for key in (
+            "new_country",
+            "edit_country_name",
+            "region_country_id",
+            "new_library_flag_name",
+            "edit_library_flag_id",
+        )
+    ):
+        return
+
+    name = normalize_user_text(update.message.caption.splitlines()[0].strip())
+    lowered = name.casefold()
+    if lowered.startswith("флаг:"):
+        name = name[5:].strip()
+    elif lowered.startswith("флаг "):
+        name = name[5:].strip()
+
+    if not name:
+        await update.message.reply_text("В подписи нужно написать название страны")
+        return
+    if len(name) > 100:
+        await update.message.reply_text("Название в подписи длиннее 100 символов")
+        return
+    if library_flag_name_exists(name):
+        await update.message.reply_text(
+            "Флаг с такой подписью уже есть. Изменить его можно через /editflag"
+        )
+        return
+
+    DATA.setdefault("flag_library", []).append(
+        {
+            "id": uuid4().hex[:12],
+            "country_name": name,
+            "flag_file_id": update.message.document.file_id,
+        }
+    )
+    save_data()
+    await update.message.reply_text(
+        f'Готово! Флаг "{name}" появился в библиотеке'
+    )
+
+async def add_library_flag_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Не-а, эта команда только для админов")
+        return ConversationHandler.END
+
+    clear_library_flag_context(context)
+    await update.message.reply_text(
+        "Напиши название страны или территории для флага"
+    )
+    return ADD_LIBRARY_FLAG_NAME
+
+
+async def add_library_flag_name(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    name = normalize_user_text(update.message.text.strip())
+    if not name:
+        await update.message.reply_text("Название не может быть пустым")
+        return ADD_LIBRARY_FLAG_NAME
+    if len(name) > 100:
+        await update.message.reply_text(
+            f"Название длинновато: {len(name)} символов. Максимум 100"
+        )
+        return ADD_LIBRARY_FLAG_NAME
+    if library_flag_name_exists(name):
+        await update.message.reply_text(
+            "Флаг с такой подписью уже есть. Изменить его можно через /editflag"
+        )
+        return ADD_LIBRARY_FLAG_NAME
+
+    context.user_data["new_library_flag_name"] = name
+    await update.message.reply_text(
+        "Теперь скинь флаг именно файлом, чтобы он сохранился без сжатия"
+    )
+    return ADD_LIBRARY_FLAG_FILE
+
+
+async def add_library_flag_file(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    name = context.user_data.get("new_library_flag_name")
+    if not name:
+        await update.message.reply_text("Название потерялось. Давай начнём заново")
+        clear_library_flag_context(context)
+        return ConversationHandler.END
+    if not update.message.document:
+        await update.message.reply_text("Флаг нужно отправить именно файлом")
+        return ADD_LIBRARY_FLAG_FILE
+
+    DATA.setdefault("flag_library", []).append(
+        {
+            "id": uuid4().hex[:12],
+            "country_name": name,
+            "flag_file_id": update.message.document.file_id,
+        }
+    )
+    save_data()
+    await update.message.reply_text(
+        f'Готово! Флаг "{name}" появился в библиотеке'
+    )
+    clear_library_flag_context(context)
+    return ConversationHandler.END
+
+
+add_library_flag_conv = ConversationHandler(
+    entry_points=[CommandHandler("addflag", add_library_flag_start)],
+    states={
+        ADD_LIBRARY_FLAG_NAME: [
+            MessageHandler(filters.TEXT & ~filters.COMMAND, add_library_flag_name)
+        ],
+        ADD_LIBRARY_FLAG_FILE: [
+            MessageHandler(
+                (filters.TEXT | filters.PHOTO | filters.Document.IMAGE)
+                & ~filters.COMMAND,
+                add_library_flag_file,
+            )
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+
+async def edit_library_flag_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Не-а, эта команда только для админов")
+        return ConversationHandler.END
+
+    kb = flag_library_keyboard(prefix="editlibraryflag")
+    if not kb:
+        await update.message.reply_text(
+            "Библиотека пока пустая. Первый флаг можно добавить через /addflag"
+        )
+        return ConversationHandler.END
+
+    clear_library_flag_context(context)
+    await update.message.reply_text("Какой флаг будем править?", reply_markup=kb)
+    return EDIT_LIBRARY_FLAG_CHOOSE
+
+
+async def edit_library_flag_choose(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    entry_id = query.data.split(":", 1)[1]
+    entry = find_library_flag(entry_id)
+    if not entry:
+        await query.message.reply_text("Похоже, этого флага уже нет")
+        return ConversationHandler.END
+
+    context.user_data["edit_library_flag_id"] = entry_id
+    buttons = [
+        [InlineKeyboardButton("✏️ Название", callback_data="editlibraryfield:name")],
+        [InlineKeyboardButton("🖼 Файл", callback_data="editlibraryfield:file")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data="editlibraryfield:delete")],
+    ]
+    await query.message.reply_text(
+        f'Правим флаг "{entry["country_name"]}". Что меняем?',
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return EDIT_LIBRARY_FLAG_FIELD
+
+
+async def edit_library_flag_field(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    field = query.data.split(":", 1)[1]
+    if field not in ("name", "file", "delete"):
+        await query.message.reply_text("Не понял, что нужно сделать")
+        clear_library_flag_context(context)
+        return ConversationHandler.END
+
+    if field == "delete":
+        entry = find_library_flag(
+            context.user_data.get("edit_library_flag_id")
+        )
+        if not entry:
+            await query.message.reply_text("Похоже, этого флага уже нет")
+            clear_library_flag_context(context)
+            return ConversationHandler.END
+        buttons = [[
+            InlineKeyboardButton("Да, удалить", callback_data="libraryflagdelete:yes"),
+            InlineKeyboardButton("Нет", callback_data="libraryflagdelete:no"),
+        ]]
+        await query.message.reply_text(
+            f'Точно удалить флаг "{entry["country_name"]}"?',
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return EDIT_LIBRARY_FLAG_CONFIRM_DELETE
+
+    context.user_data["edit_library_flag_field"] = field
+    prompt = (
+        "Напиши новую подпись для флага"
+        if field == "name"
+        else "Скинь новый флаг именно файлом, без сжатия"
+    )
+    await query.message.reply_text(prompt)
+    return EDIT_LIBRARY_FLAG_VALUE
+
+
+async def edit_library_flag_value(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    entry = find_library_flag(context.user_data.get("edit_library_flag_id"))
+    field = context.user_data.get("edit_library_flag_field")
+    if not entry:
+        await update.message.reply_text("Похоже, этого флага уже нет")
+        clear_library_flag_context(context)
+        return ConversationHandler.END
+
+    if field == "name":
+        if not update.message.text:
+            await update.message.reply_text("Название нужно прислать текстом")
+            return EDIT_LIBRARY_FLAG_VALUE
+        name = normalize_user_text(update.message.text.strip())
+        if not name:
+            await update.message.reply_text("Название не может быть пустым")
+            return EDIT_LIBRARY_FLAG_VALUE
+        if len(name) > 100:
+            await update.message.reply_text(
+                f"Название длинновато: {len(name)} символов. Максимум 100"
+            )
+            return EDIT_LIBRARY_FLAG_VALUE
+        if library_flag_name_exists(name, exclude_id=entry["id"]):
+            await update.message.reply_text("Флаг с такой подписью уже есть")
+            return EDIT_LIBRARY_FLAG_VALUE
+        entry["country_name"] = name
+
+    elif field == "file":
+        if not update.message.document:
+            await update.message.reply_text("Флаг нужно отправить именно файлом")
+            return EDIT_LIBRARY_FLAG_VALUE
+        entry["flag_file_id"] = update.message.document.file_id
+    else:
+        await update.message.reply_text("Не понял, что менять")
+        clear_library_flag_context(context)
+        return ConversationHandler.END
+
+    save_data()
+    await update.message.reply_text("Готово, флаг обновил")
+    clear_library_flag_context(context)
+    return ConversationHandler.END
+
+
+async def edit_library_flag_confirm_delete(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    answer = query.data.split(":", 1)[1]
+    if answer != "yes":
+        await query.message.reply_text("Хорошо, ничего удалять не буду")
+        clear_library_flag_context(context)
+        return ConversationHandler.END
+
+    entry = find_library_flag(context.user_data.get("edit_library_flag_id"))
+    if not entry:
+        await query.message.reply_text("Похоже, этого флага уже и так нет")
+        clear_library_flag_context(context)
+        return ConversationHandler.END
+
+    DATA["flag_library"].remove(entry)
+    save_data()
+    await query.message.reply_text(
+        f'Готово, флаг "{entry["country_name"]}" удалил'
+    )
+    clear_library_flag_context(context)
+    return ConversationHandler.END
+
+
+edit_library_flag_conv = ConversationHandler(
+    entry_points=[CommandHandler("editflag", edit_library_flag_start)],
+    states={
+        EDIT_LIBRARY_FLAG_CHOOSE: [
+            CallbackQueryHandler(
+                edit_library_flag_choose, pattern=r"^editlibraryflag:"
+            )
+        ],
+        EDIT_LIBRARY_FLAG_FIELD: [
+            CallbackQueryHandler(
+                edit_library_flag_field, pattern=r"^editlibraryfield:"
+            )
+        ],
+        EDIT_LIBRARY_FLAG_VALUE: [
+            MessageHandler(
+                (filters.TEXT | filters.PHOTO | filters.Document.IMAGE)
+                & ~filters.COMMAND,
+                edit_library_flag_value,
+            )
+        ],
+        EDIT_LIBRARY_FLAG_CONFIRM_DELETE: [
+            CallbackQueryHandler(
+                edit_library_flag_confirm_delete,
+                pattern=r"^libraryflagdelete:(yes|no)$",
+            )
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+
+# ---------------------------------------------------------------------------
 # Меню команд
 # ---------------------------------------------------------------------------
 
@@ -1242,6 +1937,8 @@ def public_commands():
     return [
         BotCommand("start", "Начать"),
         BotCommand("countries", "Список стран"),
+        BotCommand("search", "Найти страну"),
+        BotCommand("flags", "Библиотека флагов"),
     ]
 
 
@@ -1251,6 +1948,8 @@ def admin_commands():
         BotCommand("editcountry", "Редактировать страну"),
         BotCommand("addregion", "Добавить регион"),
         BotCommand("editregion", "Изменить или удалить регион"),
+        BotCommand("addflag", "Добавить флаг в библиотеку"),
+        BotCommand("editflag", "Изменить или удалить флаг"),
         BotCommand("addadmin", "Добавить админа"),
         BotCommand("admhelp", "Админ-команды"),
         BotCommand("cancel", "Отменить диалог"),
@@ -1290,21 +1989,43 @@ def main():
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("countries", cmd_countries))
+    application.add_handler(CommandHandler("flags", cmd_flags))
     application.add_handler(CommandHandler("admhelp", cmd_admhelp))
     application.add_handler(CommandHandler("addadmin", cmd_addadmin))
 
     application.add_handler(add_country_conv)
     application.add_handler(edit_country_conv)
+    application.add_handler(search_country_conv)
     application.add_handler(add_region_conv)
     application.add_handler(edit_region_conv)
+    application.add_handler(add_library_flag_conv)
+    application.add_handler(edit_library_flag_conv)
+    application.add_handler(
+        MessageHandler(filters.Document.IMAGE, quick_add_library_flag)
+    )
 
     application.add_handler(CallbackQueryHandler(cb_list_countries, pattern=r"^list_countries$"))
     application.add_handler(CallbackQueryHandler(cb_show_country, pattern=r"^country:"))
+    application.add_handler(
+        CallbackQueryHandler(cb_show_search_country, pattern=r"^searchcountry:")
+    )
     application.add_handler(CallbackQueryHandler(cb_flag, pattern=r"^flag:"))
     application.add_handler(CallbackQueryHandler(cb_herb, pattern=r"^herb:"))
     application.add_handler(CallbackQueryHandler(cb_regions, pattern=r"^regions:"))
     application.add_handler(
+        CallbackQueryHandler(cb_region_info, pattern=r"^regioninfo:")
+    )
+    application.add_handler(
         CallbackQueryHandler(cb_region_flag, pattern=r"^regionflag:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cb_list_library_flags, pattern=r"^list_library_flags$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cb_show_library_flag, pattern=r"^libraryflag:")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cb_download_library_flag, pattern=r"^downloadflag:")
     )
 
     logger.info("АУРЕЛИЯ INFO BOT запущен.")
