@@ -18,6 +18,8 @@ import json
 import logging
 import os
 import random
+import tempfile
+from datetime import datetime
 from html import escape
 from uuid import uuid4
 
@@ -55,10 +57,11 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 MAIN_ADMIN_ID = 7787565361
 
 # Версии ведём в формате MAJOR.MINOR.PATCH
-BOT_VERSION = "1.1.1"
+BOT_VERSION = "1.2.0"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 STICKER_SET_NAME = "AureliaPack"
+LIST_PAGE_SIZE = 8
 
 # ---------------------------------------------------------------------------
 # Хранилище данных (простой JSON-файл)
@@ -73,13 +76,34 @@ def normalize_user_text(text: str) -> str:
     return text
 
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
+def load_data(data_file=None):
+    data_file = data_file or DATA_FILE
+    if os.path.exists(data_file):
+        with open(data_file, "r", encoding="utf-8") as f:
             d = json.load(f)
+            if not isinstance(d, dict):
+                raise ValueError("Корень резервной копии должен быть JSON-объектом")
+            if "admins" in d and not isinstance(d["admins"], list):
+                raise ValueError("Поле admins должно быть списком")
+            if "countries" in d and not isinstance(d["countries"], dict):
+                raise ValueError("Поле countries должно быть объектом")
+            if "flag_library" in d and not isinstance(
+                d["flag_library"], (list, dict)
+            ):
+                raise ValueError("Поле flag_library должно быть списком или объектом")
             d.setdefault("admins", [])
             d.setdefault("countries", {})
             d.setdefault("flag_library", [])
+
+            normalized_admins = []
+            for admin_id in d["admins"]:
+                try:
+                    admin_id = int(admin_id)
+                except (TypeError, ValueError):
+                    continue
+                if admin_id not in normalized_admins and admin_id != MAIN_ADMIN_ID:
+                    normalized_admins.append(admin_id)
+            d["admins"] = normalized_admins
 
             # Сразу приводим старые тексты к обычному дефису и прямым
             # кавычкам, чтобы старое оформление не возвращалось из data.json.
@@ -199,8 +223,46 @@ def load_data():
 
 
 def save_data():
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(DATA, f, ensure_ascii=False, indent=2)
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        dir=os.path.dirname(DATA_FILE), prefix=".aurelia_data_", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            json.dump(DATA, temporary_file, ensure_ascii=False, indent=2)
+            temporary_file.flush()
+            os.fsync(temporary_file.fileno())
+        os.replace(temporary_path, DATA_FILE)
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
+
+
+def load_backup_payload(payload: bytes):
+    try:
+        raw_data = json.loads(payload.decode("utf-8-sig"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("Файл не похож на корректную JSON-копию") from error
+
+    file_descriptor, temporary_path = tempfile.mkstemp(
+        prefix="aurelia_restore_", suffix=".json"
+    )
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as temporary_file:
+            json.dump(raw_data, temporary_file, ensure_ascii=False)
+        restored_data = load_data(temporary_path)
+        for country_name, country in restored_data["countries"].items():
+            if not country_name:
+                raise ValueError("В копии нашлась страна без названия")
+            if not country.get("card_file_id"):
+                raise ValueError(
+                    f'У страны "{country_name}" нет файла карточки'
+                )
+            if not country.get("flag_file_id"):
+                raise ValueError(f'У страны "{country_name}" нет флага')
+        return restored_data
+    finally:
+        if os.path.exists(temporary_path):
+            os.unlink(temporary_path)
 
 
 DATA = load_data()
@@ -255,6 +317,8 @@ SEARCH_COUNTRY_QUERY = 10
     EDIT_LIBRARY_FLAG_CONFIRM_DELETE,
 ) = range(60, 64)
 
+(RESTORE_BACKUP_FILE, RESTORE_BACKUP_CONFIRM) = range(70, 72)
+
 EDIT_FIELDS = {
     "name": "Название",
     "leader": "Лидер",
@@ -271,6 +335,36 @@ EDIT_FIELDS = {
 # Вспомогательные функции для клавиатур и вывода
 # ---------------------------------------------------------------------------
 
+def paginate_items(items, page: int):
+    total_pages = max(1, (len(items) + LIST_PAGE_SIZE - 1) // LIST_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * LIST_PAGE_SIZE
+    return items[start:start + LIST_PAGE_SIZE], page, total_pages
+
+
+def pagination_row(page: int, total_pages: int, callback_prefix: str):
+    row = []
+    if page > 0:
+        row.append(
+            InlineKeyboardButton(
+                "⬅️ Назад", callback_data=f"{callback_prefix}:{page - 1}"
+            )
+        )
+    if page + 1 < total_pages:
+        row.append(
+            InlineKeyboardButton(
+                "Дальше ➡️", callback_data=f"{callback_prefix}:{page + 1}"
+            )
+        )
+    return row
+
+
+def paginated_list_text(text: str, page: int, total_pages: int) -> str:
+    if total_pages <= 1:
+        return text
+    return f"{text}\n\nСтраница {page + 1} из {total_pages}"
+
+
 def countries_keyboard(prefix="country", use_ids=False):
     names = sorted(DATA["countries"].keys())
     buttons = []
@@ -286,6 +380,26 @@ def countries_keyboard(prefix="country", use_ids=False):
     if row:
         buttons.append(row)
     return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def countries_page_keyboard(page=0):
+    names = sorted(DATA["countries"].keys())
+    page_names, page, total_pages = paginate_items(names, page)
+    buttons = []
+    row = []
+    for index, name in enumerate(page_names, start=1):
+        row.append(InlineKeyboardButton(name, callback_data=f"country:{name}"))
+        if index % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    navigation = pagination_row(page, total_pages, "countriespage")
+    if navigation:
+        buttons.append(navigation)
+    keyboard = InlineKeyboardMarkup(buttons) if page_names else None
+    return keyboard, page, total_pages
 
 
 def get_country_by_id(country_id: str):
@@ -422,7 +536,7 @@ def sync_entity_flags_to_library() -> bool:
     return changed
 
 
-def flag_choice_keyboard(prefix: str, allow_none: bool = False):
+def flag_choice_keyboard(prefix: str, allow_none: bool = False, page=0):
     buttons = [
         [InlineKeyboardButton("Загрузить новый флаг", callback_data=f"{prefix}:new")]
     ]
@@ -431,10 +545,12 @@ def flag_choice_keyboard(prefix: str, allow_none: bool = False):
             [InlineKeyboardButton("Без флага", callback_data=f"{prefix}:none")]
         )
 
-    for entry in sorted(
+    entries = sorted(
         DATA.get("flag_library", []),
         key=lambda item: item["country_name"].casefold(),
-    ):
+    )
+    page_entries, page, total_pages = paginate_items(entries, page)
+    for entry in page_entries:
         buttons.append(
             [
                 InlineKeyboardButton(
@@ -443,6 +559,9 @@ def flag_choice_keyboard(prefix: str, allow_none: bool = False):
                 )
             ]
         )
+    navigation = pagination_row(page, total_pages, f"{prefix}:page")
+    if navigation:
+        buttons.append(navigation)
     return InlineKeyboardMarkup(buttons)
 
 
@@ -524,6 +643,29 @@ def regions_keyboard(country: dict, prefix="regioninfo"):
     return InlineKeyboardMarkup(buttons) if buttons else None
 
 
+def regions_page_keyboard(country: dict, page=0):
+    regions = sorted(
+        country.get("regions", []), key=lambda item: item["name"].casefold()
+    )
+    page_regions, page, total_pages = paginate_items(regions, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                region["name"],
+                callback_data=f"regioninfo:{country['id']}:{region['id']}",
+            )
+        ]
+        for region in page_regions
+    ]
+    navigation = pagination_row(
+        page, total_pages, f"regionspage:{country['id']}"
+    )
+    if navigation:
+        buttons.append(navigation)
+    keyboard = InlineKeyboardMarkup(buttons) if page_regions else None
+    return keyboard, page, total_pages
+
+
 def flag_library_keyboard(prefix="libraryflag"):
     buttons = [
         [
@@ -538,6 +680,28 @@ def flag_library_keyboard(prefix="libraryflag"):
         )
     ]
     return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def flag_library_page_keyboard(page=0):
+    entries = sorted(
+        DATA.get("flag_library", []),
+        key=lambda item: item["country_name"].casefold(),
+    )
+    page_entries, page, total_pages = paginate_items(entries, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                f"Флаг {entry['country_name']}",
+                callback_data=f"libraryflag:{entry['id']}",
+            )
+        ]
+        for entry in page_entries
+    ]
+    navigation = pagination_row(page, total_pages, "flagspage")
+    if navigation:
+        buttons.append(navigation)
+    keyboard = InlineKeyboardMarkup(buttons) if page_entries else None
+    return keyboard, page, total_pages
 
 
 def build_info_text(c: dict) -> str:
@@ -630,21 +794,41 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_countries(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = countries_keyboard()
+    kb, page, total_pages = countries_page_keyboard()
     if not kb:
         await update.message.reply_text("Тут пока пусто - ни одной страны ещё не добавили")
         return
-    await update.message.reply_text("Выбирай страну:", reply_markup=kb)
+    await update.message.reply_text(
+        paginated_list_text("Выбирай страну:", page, total_pages),
+        reply_markup=kb,
+    )
 
 
 async def cb_list_countries(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    kb = countries_keyboard()
+    kb, page, total_pages = countries_page_keyboard()
     if not kb:
         await query.edit_message_text("Тут пока пусто - ни одной страны ещё не добавили")
         return
-    await query.message.reply_text("Выбирай страну:", reply_markup=kb)
+    await query.message.reply_text(
+        paginated_list_text("Выбирай страну:", page, total_pages),
+        reply_markup=kb,
+    )
+
+
+async def cb_countries_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.rsplit(":", 1)[1])
+    kb, page, total_pages = countries_page_keyboard(page)
+    if not kb:
+        await query.edit_message_text("Тут пока пусто - ни одной страны ещё не добавили")
+        return
+    await query.edit_message_text(
+        paginated_list_text("Выбирай страну:", page, total_pages),
+        reply_markup=kb,
+    )
 
 
 async def send_country_details(message, context, name: str, country: dict):
@@ -713,21 +897,41 @@ async def cb_show_search_country(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def cmd_flags(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = flag_library_keyboard()
+    kb, page, total_pages = flag_library_page_keyboard()
     if not kb:
         await update.message.reply_text("Библиотека флагов пока пустая")
         return
-    await update.message.reply_text("Выбирай флаг:", reply_markup=kb)
+    await update.message.reply_text(
+        paginated_list_text("Выбирай флаг:", page, total_pages),
+        reply_markup=kb,
+    )
 
 
 async def cb_list_library_flags(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    kb = flag_library_keyboard()
+    kb, page, total_pages = flag_library_page_keyboard()
     if not kb:
         await query.message.reply_text("Библиотека флагов пока пустая")
         return
-    await query.message.reply_text("Выбирай флаг:", reply_markup=kb)
+    await query.message.reply_text(
+        paginated_list_text("Выбирай флаг:", page, total_pages),
+        reply_markup=kb,
+    )
+
+
+async def cb_flags_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.rsplit(":", 1)[1])
+    kb, page, total_pages = flag_library_page_keyboard(page)
+    if not kb:
+        await query.edit_message_text("Библиотека флагов пока пустая")
+        return
+    await query.edit_message_text(
+        paginated_list_text("Выбирай флаг:", page, total_pages),
+        reply_markup=kb,
+    )
 
 
 async def cb_show_library_flag(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -841,15 +1045,47 @@ async def cb_regions(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("Похоже, этой страны уже нет", show_alert=True)
         return
 
-    kb = regions_keyboard(country)
+    kb, page, total_pages = regions_page_keyboard(country)
     if not kb:
         await query.answer("Регионы сюда пока не добавили", show_alert=True)
         return
 
     await query.answer()
-    await query.message.reply_text(
+    text = (
         f'Вот регионы страны "{name}"\n\n'
-        "Выбирай любой - покажу его столицу, описание и флаг",
+        "Выбирай любой - покажу его столицу, описание и флаг"
+    )
+    await query.message.reply_text(
+        paginated_list_text(text, page, total_pages),
+        reply_markup=kb,
+    )
+
+
+async def cb_regions_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, raw_page = query.data.split(":", 2)
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        await query.message.reply_text("Эта кнопка почему-то сломалась")
+        return
+
+    name, country = get_country_by_id(country_id)
+    if not country:
+        await query.edit_message_text("Похоже, этой страны уже нет")
+        return
+
+    kb, page, total_pages = regions_page_keyboard(country, page)
+    if not kb:
+        await query.edit_message_text("Регионы сюда пока не добавили")
+        return
+    text = (
+        f'Вот регионы страны "{name}"\n\n'
+        "Выбирай любой - покажу его столицу, описание и флаг"
+    )
+    await query.edit_message_text(
+        paginated_list_text(text, page, total_pages),
         reply_markup=kb,
     )
 
@@ -922,6 +1158,8 @@ async def cmd_admhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/addflag - добавить флаг в библиотеку\n"
         "/editflag - изменить или удалить флаг из библиотеки\n"
         "Также можно просто отправить флаг файлом и написать страну в подписи\n"
+        "/backup - скачать резервную копию базы\n"
+        "/restore - восстановить базу из резервной копии\n"
         "/addadmin &lt;user_id&gt; - добавить нового админа\n"
         "/admhelp - это сообщение\n"
         "/cancel - отменить текущий диалог добавления/редактирования"
@@ -964,6 +1202,152 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.warning("Не удалось выставить меню команд новому админу: %s", e)
 
     await update.message.reply_text(f"Готово! Пользователь {new_admin_id} теперь админ")
+
+
+# ---------------------------------------------------------------------------
+# Резервные копии
+# ---------------------------------------------------------------------------
+
+def database_counts(data: dict):
+    countries_count = len(data.get("countries", {}))
+    regions_count = sum(
+        len(country.get("regions", []))
+        for country in data.get("countries", {}).values()
+    )
+    flags_count = len(data.get("flag_library", []))
+    return countries_count, regions_count, flags_count
+
+
+def clear_restore_context(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("restore_backup_data", None)
+
+
+async def send_database_backup(message, caption: str, filename_prefix="aurelia_backup"):
+    save_data()
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"{filename_prefix}_{timestamp}.json"
+    with open(DATA_FILE, "rb") as backup_file:
+        await message.reply_document(
+            document=InputFile(backup_file, filename=filename),
+            caption=caption,
+        )
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Не-а, эта команда только для админов")
+        return
+
+    countries_count, regions_count, flags_count = database_counts(DATA)
+    await send_database_backup(
+        update.message,
+        (
+            "Готово, вот свежая резервная копия\n\n"
+            f"Стран: {countries_count}\n"
+            f"Регионов: {regions_count}\n"
+            f"Флагов: {flags_count}"
+        ),
+    )
+
+
+async def restore_backup_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Не-а, эта команда только для админов")
+        return ConversationHandler.END
+
+    clear_restore_context(context)
+    await update.message.reply_text(
+        "Скинь JSON-файл резервной копии\n\n"
+        "Сначала я всё проверю и только потом попрошу подтверждение"
+    )
+    return RESTORE_BACKUP_FILE
+
+
+async def restore_backup_file(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("Мне нужен именно JSON-файл резервной копии")
+        return RESTORE_BACKUP_FILE
+    if document.file_size and document.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("Файл тяжелее 20 МБ, такую копию я не смогу проверить")
+        return RESTORE_BACKUP_FILE
+
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        payload = bytes(await telegram_file.download_as_bytearray())
+        restored_data = load_backup_payload(payload)
+    except Exception as error:
+        logger.warning("Не удалось проверить резервную копию: %s", error)
+        await update.message.reply_text(
+            f"Не получилось прочитать эту копию\n\nПричина: {error}"
+        )
+        return RESTORE_BACKUP_FILE
+
+    countries_count, regions_count, flags_count = database_counts(restored_data)
+    context.user_data["restore_backup_data"] = restored_data
+    buttons = [[
+        InlineKeyboardButton("Восстановить", callback_data="restorebackup:yes"),
+        InlineKeyboardButton("Отмена", callback_data="restorebackup:no"),
+    ]]
+    await update.message.reply_text(
+        "Копия выглядит нормально\n\n"
+        f"Стран: {countries_count}\n"
+        f"Регионов: {regions_count}\n"
+        f"Флагов: {flags_count}\n\n"
+        "Заменяем текущую базу?",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    return RESTORE_BACKUP_CONFIRM
+
+
+async def restore_backup_confirm(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    answer = query.data.split(":", 1)[1]
+    if answer != "yes":
+        clear_restore_context(context)
+        await query.edit_message_text("Хорошо, текущую базу не трогаю")
+        return ConversationHandler.END
+
+    restored_data = context.user_data.get("restore_backup_data")
+    if not restored_data:
+        await query.edit_message_text("Данные копии потерялись. Запусти /restore ещё раз")
+        clear_restore_context(context)
+        return ConversationHandler.END
+
+    try:
+        await send_database_backup(
+            query.message,
+            "Страховочная копия базы перед восстановлением",
+            filename_prefix="aurelia_before_restore",
+        )
+    except Exception as error:
+        logger.warning("Не удалось отправить страховочную копию: %s", error)
+        await query.message.reply_text(
+            "Не смог отправить страховочную копию, поэтому восстановление отменил"
+        )
+        clear_restore_context(context)
+        return ConversationHandler.END
+
+    DATA.clear()
+    DATA.update(restored_data)
+    sync_entity_flags_to_library()
+    save_data()
+    countries_count, regions_count, flags_count = database_counts(DATA)
+    clear_restore_context(context)
+    await query.edit_message_text(
+        "Готово, базу восстановил\n\n"
+        f"Стран: {countries_count}\n"
+        f"Регионов: {regions_count}\n"
+        f"Флагов: {flags_count}"
+    )
+    return ConversationHandler.END
 
 
 # ---------------------------------------------------------------------------
@@ -1046,6 +1430,14 @@ async def add_country_flag_choice(
     if not country:
         await query.message.reply_text("Данные страны потерялись. Давай начнём заново")
         return ConversationHandler.END
+
+    if choice.startswith("page:"):
+        page = int(choice.split(":", 1)[1])
+        await query.edit_message_text(
+            "Теперь выбери готовый флаг из библиотеки или загрузи новый",
+            reply_markup=flag_choice_keyboard("addcountryflag", page=page),
+        )
+        return ADD_FLAG
 
     if choice == "new":
         await query.message.reply_text(
@@ -1150,6 +1542,22 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data.clear()
     await update.message.reply_text("Окей, всё отменил")
     return ConversationHandler.END
+
+
+restore_backup_conv = ConversationHandler(
+    entry_points=[CommandHandler("restore", restore_backup_start)],
+    states={
+        RESTORE_BACKUP_FILE: [
+            MessageHandler(filters.Document.ALL, restore_backup_file)
+        ],
+        RESTORE_BACKUP_CONFIRM: [
+            CallbackQueryHandler(
+                restore_backup_confirm, pattern=r"^restorebackup:(yes|no)$"
+            )
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
 
 
 search_country_conv = ConversationHandler(
@@ -1466,7 +1874,7 @@ async def finish_add_region(
     region_capital = context.user_data.get("new_region_capital")
     region_description = context.user_data.get("new_region_description", "")
     if not country or not region_name or not region_capital:
-        await update.message.reply_text("Что-то потерялось по дороге. Я всё отменил")
+        await message.reply_text("Что-то потерялось по дороге. Я всё отменил")
         clear_region_context(context)
         return ConversationHandler.END
 
@@ -1499,6 +1907,16 @@ async def add_region_flag_choice(
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":", 1)[1]
+
+    if choice.startswith("page:"):
+        page = int(choice.split(":", 1)[1])
+        await query.edit_message_text(
+            "Теперь выбери готовый флаг из библиотеки, загрузи новый или оставь регион без флага",
+            reply_markup=flag_choice_keyboard(
+                "addregionflag", allow_none=True, page=page
+            ),
+        )
+        return ADD_REGION_FLAG
 
     if choice == "new":
         await query.message.reply_text(
@@ -2230,6 +2648,8 @@ def admin_commands():
         BotCommand("editregion", "Изменить или удалить регион"),
         BotCommand("addflag", "Добавить флаг в библиотеку"),
         BotCommand("editflag", "Изменить или удалить флаг"),
+        BotCommand("backup", "Скачать резервную копию"),
+        BotCommand("restore", "Восстановить резервную копию"),
         BotCommand("addadmin", "Добавить админа"),
         BotCommand("admhelp", "Админ-команды"),
         BotCommand("cancel", "Отменить диалог"),
@@ -2275,7 +2695,9 @@ def main():
     application.add_handler(CommandHandler("flags", cmd_flags))
     application.add_handler(CommandHandler("admhelp", cmd_admhelp))
     application.add_handler(CommandHandler("addadmin", cmd_addadmin))
+    application.add_handler(CommandHandler("backup", cmd_backup))
 
+    application.add_handler(restore_backup_conv)
     application.add_handler(add_country_conv)
     application.add_handler(edit_country_conv)
     application.add_handler(search_country_conv)
@@ -2288,6 +2710,9 @@ def main():
     )
 
     application.add_handler(CallbackQueryHandler(cb_list_countries, pattern=r"^list_countries$"))
+    application.add_handler(
+        CallbackQueryHandler(cb_countries_page, pattern=r"^countriespage:\d+$")
+    )
     application.add_handler(CallbackQueryHandler(cb_show_country, pattern=r"^country:"))
     application.add_handler(
         CallbackQueryHandler(cb_show_search_country, pattern=r"^searchcountry:")
@@ -2296,6 +2721,11 @@ def main():
     application.add_handler(CallbackQueryHandler(cb_herb, pattern=r"^herb:"))
     application.add_handler(CallbackQueryHandler(cb_regions, pattern=r"^regions:"))
     application.add_handler(
+        CallbackQueryHandler(
+            cb_regions_page, pattern=r"^regionspage:[^:]+:\d+$"
+        )
+    )
+    application.add_handler(
         CallbackQueryHandler(cb_region_info, pattern=r"^regioninfo:")
     )
     application.add_handler(
@@ -2303,6 +2733,9 @@ def main():
     )
     application.add_handler(
         CallbackQueryHandler(cb_list_library_flags, pattern=r"^list_library_flags$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cb_flags_page, pattern=r"^flagspage:\d+$")
     )
     application.add_handler(
         CallbackQueryHandler(cb_show_library_flag, pattern=r"^libraryflag:")
