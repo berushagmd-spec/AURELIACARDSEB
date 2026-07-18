@@ -63,7 +63,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 MAIN_ADMIN_ID = 7787565361
 
 # Версии ведём в формате MAJOR.MINOR.PATCH
-BOT_VERSION = "1.6.0"
+BOT_VERSION = "1.7.0"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 STICKER_SET_NAME = "AureliaPack"
@@ -119,7 +119,7 @@ def clean_journal_text(lines) -> str:
 
 
 FOUR_DIGIT_YEAR_TOKEN = r"(?:1\d{3}|20\d{2})"
-EVENT_YEAR_TOKEN = rf"(?:[1-9]\d{{2}}|{FOUR_DIGIT_YEAR_TOKEN})"
+EVENT_YEAR_TOKEN = FOUR_DIGIT_YEAR_TOKEN
 RUSSIAN_MONTH_PATTERN = (
     r"(?:январ(?:ь|я)|феврал(?:ь|я)|март(?:а)?|апрел(?:ь|я)|май|мая|"
     r"июн(?:ь|я)|июл(?:ь|я)|август(?:а)?|сентябр(?:ь|я)|"
@@ -154,10 +154,6 @@ EVENT_DATE_PATTERNS = (
     re.compile(
         rf"\b{EVENT_YEAR_TOKEN}\s*-\s*{EVENT_YEAR_TOKEN}"
         r"(?:\s*(?:годы|гг?\.))?\b",
-        flags=re.IGNORECASE,
-    ),
-    re.compile(
-        r"\b[1-9]\d{2}\s*г(?:од(?:а|у|ом)?)?\.?(?=\s|$|[,;:])",
         flags=re.IGNORECASE,
     ),
     re.compile(
@@ -749,6 +745,9 @@ SEARCH_COUNTRY_QUERY = 12
     ADD_HISTORY_FILE,
 ) = range(80, 83)
 
+EVENT_SEARCH_QUERY = 90
+EVENT_SEARCH_LIMIT = 300
+
 EDIT_FIELDS = {
     "name": "Название",
     "leader": "Лидер",
@@ -1304,6 +1303,101 @@ def find_subevent(major_event: dict, subevent_id: str):
         ),
         None,
     )
+
+
+def normalize_event_search_text(text: str) -> str:
+    normalized = normalize_user_text(text or "").casefold().replace("ё", "е")
+    normalized = re.sub(r"[^\w]+", " ", normalized).replace("_", " ")
+    return " ".join(normalized.split())
+
+
+def search_journal_events(search_text: str):
+    normalized_query = normalize_event_search_text(search_text)
+    terms = normalized_query.split()
+    if not terms:
+        return []
+
+    results = []
+    sequence = 0
+    for lore_country in DATA.get("lore_countries", []):
+        country_name = lore_country_display_name(lore_country)
+        for history in lore_country.get("event_histories", []):
+            for major_event in history.get("major_events", []):
+                events = [("major", major_event, None)]
+                events.extend(
+                    ("subevent", subevent, major_event)
+                    for subevent in major_event.get("subevents", [])
+                )
+                for event_type, event, parent_major in events:
+                    title = event_title_with_date(event)
+                    normalized_title = normalize_event_search_text(title)
+                    normalized_text = normalize_event_search_text(
+                        str(event.get("text") or "")
+                    )
+                    haystack = f"{normalized_title}\n{normalized_text}"
+                    if not all(term in haystack for term in terms):
+                        continue
+                    if normalized_title == normalized_query:
+                        score = 0
+                    elif normalized_title.startswith(normalized_query):
+                        score = 1
+                    elif normalized_query in normalized_title:
+                        score = 2
+                    else:
+                        score = 3
+                    results.append(
+                        {
+                            "type": event_type,
+                            "country_id": lore_country["id"],
+                            "country_name": country_name,
+                            "history_id": history["id"],
+                            "major_id": (
+                                major_event["id"]
+                                if event_type == "major"
+                                else parent_major["id"]
+                            ),
+                            "event_id": event["id"],
+                            "title": title,
+                            "score": score,
+                            "sequence": sequence,
+                        }
+                    )
+                    sequence += 1
+
+    results.sort(key=lambda item: (item["score"], item["sequence"]))
+    return results[:EVENT_SEARCH_LIMIT]
+
+
+def event_search_results_keyboard(results, page=0):
+    page_results, page, total_pages = paginate_items(results, page)
+    buttons = []
+    for result in page_results:
+        if result["type"] == "major":
+            icon = "🔷"
+            callback_data = (
+                f"journalmajor:{result['country_id']}:"
+                f"{result['history_id']}:{result['major_id']}"
+            )
+        else:
+            icon = "▫️"
+            callback_data = (
+                f"journalsub:{result['country_id']}:"
+                f"{result['history_id']}:{result['major_id']}:"
+                f"{result['event_id']}"
+            )
+        label = short_button_text(
+            f"{icon} {result['title']} - {result['country_name']}"
+        )
+        buttons.append(
+            [InlineKeyboardButton(label, callback_data=callback_data)]
+        )
+    navigation = pagination_row(page, total_pages, "eventsearchpage")
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="mainmenu")]
+    )
+    return InlineKeyboardMarkup(buttons), page, total_pages
 
 
 def journal_countries_page_keyboard(page=0):
@@ -2343,6 +2437,7 @@ def start_keyboard():
         [
             [InlineKeyboardButton("📋 Список стран", callback_data="list_countries")],
             [InlineKeyboardButton("🔎 Поиск страны", callback_data="search_countries")],
+            [InlineKeyboardButton("🔎 Поиск событий", callback_data="search_events")],
             [InlineKeyboardButton("📜 Журнал событий", callback_data="journal")],
             [InlineKeyboardButton("Библиотека флагов", callback_data="list_library_flags")],
         ]
@@ -2469,7 +2564,7 @@ async def send_journal_detail(
                 [[InlineKeyboardButton(back_text, callback_data=back_callback)]]
             )
         await message.reply_text(
-            f"{heading}{escape(chunk)}",
+            f"{heading}<blockquote expandable>{escape(chunk)}</blockquote>",
             parse_mode=ParseMode.HTML,
             reply_markup=reply_markup,
         )
@@ -2753,6 +2848,107 @@ async def cb_journal_subevent(
         "⬅️ К подсобытиям",
         f"journalmajor:{country_id}:{history_id}:{major_id}",
     )
+
+
+def clear_event_search_context(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("event_search_results", None)
+    context.user_data.pop("event_search_query", None)
+
+
+def event_search_results_text(results, page, total_pages):
+    if len(results) >= EVENT_SEARCH_LIMIT:
+        heading = f"Показываю первые {EVENT_SEARCH_LIMIT} совпадений"
+    else:
+        heading = f"Нашёл событий: {len(results)}"
+    return paginated_list_text(
+        f"{heading}\n\n🔷 - большое событие\n▫️ - мелкое событие",
+        page,
+        total_pages,
+    )
+
+
+async def event_search_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if update.callback_query:
+        await update.callback_query.answer()
+    clear_event_search_context(context)
+    await update.effective_message.reply_text(
+        "Напиши, что ищем в событиях\n\n"
+        "Проверю названия и полный текст больших и мелких событий"
+    )
+    return EVENT_SEARCH_QUERY
+
+
+async def event_search_query(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    search_text = normalize_user_text(update.message.text or "").strip()
+    if len(search_text) < 2:
+        await update.message.reply_text("Нужно хотя бы два символа")
+        return EVENT_SEARCH_QUERY
+    results = search_journal_events(search_text)
+    if not results:
+        clear_event_search_context(context)
+        await update.message.reply_text(
+            "Ничего не нашёл - попробуй другое слово или часть фразы"
+        )
+        return EVENT_SEARCH_QUERY
+    context.user_data["event_search_results"] = results
+    context.user_data["event_search_query"] = search_text
+    keyboard, page, total_pages = event_search_results_keyboard(results)
+    await update.message.reply_text(
+        event_search_results_text(results, page, total_pages),
+        reply_markup=keyboard,
+    )
+    return EVENT_SEARCH_QUERY
+
+
+async def event_search_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    results = context.user_data.get("event_search_results") or []
+    if not results:
+        await query.edit_message_text(
+            "Поиск уже устарел - запусти его ещё раз",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад в меню", callback_data="mainmenu")]]
+            ),
+        )
+        return ConversationHandler.END
+    page = int(query.data.rsplit(":", 1)[1])
+    keyboard, page, total_pages = event_search_results_keyboard(results, page)
+    await query.edit_message_text(
+        event_search_results_text(results, page, total_pages),
+        reply_markup=keyboard,
+    )
+    return EVENT_SEARCH_QUERY
+
+
+async def event_search_open_major(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    clear_event_search_context(context)
+    await cb_journal_major(update, context)
+    return ConversationHandler.END
+
+
+async def event_search_open_subevent(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    clear_event_search_context(context)
+    await cb_journal_subevent(update, context)
+    return ConversationHandler.END
+
+
+async def event_search_back_to_menu(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    clear_event_search_context(context)
+    await cb_main_menu(update, context)
+    return ConversationHandler.END
 
 
 async def send_country_details(message, context, name: str, country: dict):
@@ -4036,6 +4232,36 @@ search_country_conv = ConversationHandler(
     states={
         SEARCH_COUNTRY_QUERY: [
             MessageHandler(filters.TEXT & ~filters.COMMAND, search_country_value)
+        ]
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+
+event_search_conv = ConversationHandler(
+    entry_points=[
+        CommandHandler(["searchevents", "eventsearch"], event_search_start),
+        CallbackQueryHandler(event_search_start, pattern=r"^search_events$"),
+    ],
+    states={
+        EVENT_SEARCH_QUERY: [
+            CallbackQueryHandler(
+                event_search_back_to_menu, pattern=r"^mainmenu$"
+            ),
+            CallbackQueryHandler(
+                event_search_page, pattern=r"^eventsearchpage:\d+$"
+            ),
+            CallbackQueryHandler(
+                event_search_open_major,
+                pattern=r"^journalmajor:[^:]+:[^:]+:[^:]+$",
+            ),
+            CallbackQueryHandler(
+                event_search_open_subevent,
+                pattern=r"^journalsub:[^:]+:[^:]+:[^:]+:[^:]+$",
+            ),
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND, event_search_query
+            ),
         ]
     },
     fallbacks=[CommandHandler("cancel", cancel)],
@@ -5416,6 +5642,7 @@ def public_commands():
         BotCommand("start", "Начать"),
         BotCommand("countries", "Список стран"),
         BotCommand("search", "Найти страну"),
+        BotCommand("searchevents", "Найти событие"),
         BotCommand("journal", "Журнал событий"),
         BotCommand("flags", "Библиотека флагов"),
     ]
@@ -5482,6 +5709,7 @@ def main():
 
     application.add_handler(restore_backup_conv)
     application.add_handler(add_history_conv)
+    application.add_handler(event_search_conv)
     application.add_handler(add_country_conv)
     application.add_handler(edit_country_conv)
     application.add_handler(search_country_conv)
