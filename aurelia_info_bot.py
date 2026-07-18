@@ -63,7 +63,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 MAIN_ADMIN_ID = 7787565361
 
 # Версии ведём в формате MAJOR.MINOR.PATCH
-BOT_VERSION = "1.5.1"
+BOT_VERSION = "1.6.0"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 STICKER_SET_NAME = "AureliaPack"
@@ -118,6 +118,124 @@ def clean_journal_text(lines) -> str:
     return re.sub(r"\n{3,}", "\n\n", text)
 
 
+FOUR_DIGIT_YEAR_TOKEN = r"(?:1\d{3}|20\d{2})"
+EVENT_YEAR_TOKEN = rf"(?:[1-9]\d{{2}}|{FOUR_DIGIT_YEAR_TOKEN})"
+RUSSIAN_MONTH_PATTERN = (
+    r"(?:январ(?:ь|я)|феврал(?:ь|я)|март(?:а)?|апрел(?:ь|я)|май|мая|"
+    r"июн(?:ь|я)|июл(?:ь|я)|август(?:а)?|сентябр(?:ь|я)|"
+    r"октябр(?:ь|я)|ноябр(?:ь|я)|декабр(?:ь|я))"
+)
+EVENT_DATE_PATTERNS = (
+    re.compile(
+        rf"\b\d{{1,2}}\s+{RUSSIAN_MONTH_PATTERN}\s*(?:-|по)\s*"
+        rf"\d{{1,2}}\s+{RUSSIAN_MONTH_PATTERN}\s+"
+        rf"{EVENT_YEAR_TOKEN}(?:\s*г(?:ода|\.)?)?\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b\d{{1,2}}\s*(?:-|по)\s*\d{{1,2}}\s+"
+        rf"{RUSSIAN_MONTH_PATTERN}\s+{EVENT_YEAR_TOKEN}"
+        r"(?:\s*г(?:ода|\.)?)?\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b\d{{1,2}}\s+{RUSSIAN_MONTH_PATTERN}\s+"
+        rf"{EVENT_YEAR_TOKEN}(?:\s*г(?:ода|\.)?)?\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b\d{{1,2}}[./]\d{{1,2}}[./]{EVENT_YEAR_TOKEN}\b"
+    ),
+    re.compile(
+        rf"\b{RUSSIAN_MONTH_PATTERN}\s+{EVENT_YEAR_TOKEN}"
+        r"(?:\s*г(?:ода|\.)?)?\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{EVENT_YEAR_TOKEN}\s*-\s*{EVENT_YEAR_TOKEN}"
+        r"(?:\s*(?:годы|гг?\.))?\b",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b[1-9]\d{2}\s*г(?:од(?:а|у|ом)?)?\.?(?=\s|$|[,;:])",
+        flags=re.IGNORECASE,
+    ),
+    re.compile(
+        rf"\b{FOUR_DIGIT_YEAR_TOKEN}"
+        r"(?:\s*г(?:од(?:а|у|ом)?|\.))?\b",
+        flags=re.IGNORECASE,
+    ),
+)
+
+
+def extract_event_date(text: str) -> str:
+    compact = " ".join(normalize_user_text(text or "").split())
+    if not compact:
+        return ""
+    best_match = None
+    for priority, pattern in enumerate(EVENT_DATE_PATTERNS):
+        match = pattern.search(compact)
+        if not match:
+            continue
+        candidate = (match.start(), priority, match.group(0))
+        if best_match is None or candidate[:2] < best_match[:2]:
+            best_match = candidate
+    if not best_match:
+        return ""
+    found_date = best_match[2].strip(" ,;:.")
+    if re.fullmatch(
+        rf"{EVENT_YEAR_TOKEN}\s*г(?:од(?:а|у|ом)?|\.)?",
+        found_date,
+        flags=re.IGNORECASE,
+    ):
+        year_match = re.search(EVENT_YEAR_TOKEN, found_date)
+        return year_match.group(0) if year_match else found_date
+    return found_date
+
+
+def event_date(event: dict) -> str:
+    if not event:
+        return ""
+    stored_date = normalize_user_text(str(event.get("date") or "").strip())
+    if stored_date:
+        return stored_date
+    return extract_event_date(
+        f"{event.get('title') or ''}\n{event.get('text') or ''}"
+    )
+
+
+def event_title_with_date(event: dict) -> str:
+    title = normalize_user_text(str(event.get("title") or "").strip())
+    found_date = event_date(event)
+    if not found_date or found_date.casefold() in title.casefold():
+        return title
+    return f"{found_date} - {title}"
+
+
+def merge_event_histories(target, incoming):
+    known_titles = {
+        str(history.get("title") or "").strip().casefold()
+        for history in target
+        if isinstance(history, dict)
+    }
+    known_ids = {
+        str(history.get("id") or "").strip()
+        for history in target
+        if isinstance(history, dict)
+    }
+    for history in incoming:
+        title_key = str(history.get("title") or "").strip().casefold()
+        if not title_key or title_key in known_titles:
+            continue
+        history_id = str(history.get("id") or "").strip()
+        while not history_id or history_id in known_ids:
+            history_id = uuid4().hex[:12]
+        history["id"] = history_id
+        known_ids.add(history_id)
+        known_titles.add(title_key)
+        target.append(history)
+
+
 def normalize_event_histories(raw_histories):
     if not isinstance(raw_histories, list):
         return []
@@ -163,22 +281,34 @@ def normalize_event_histories(raw_histories):
                 while not subevent_id or subevent_id in used_subevent_ids:
                     subevent_id = uuid4().hex[:12]
                 used_subevent_ids.add(subevent_id)
+                subevent_text = normalize_user_text(
+                    str(raw_subevent.get("text") or "").strip()
+                )
+                subevent_date = normalize_user_text(
+                    str(raw_subevent.get("date") or "").strip()
+                ) or extract_event_date(
+                    f"{subevent_title}\n{subevent_text}"
+                )
                 subevents.append(
                     {
                         "id": subevent_id,
                         "title": subevent_title,
-                        "text": normalize_user_text(
-                            str(raw_subevent.get("text") or "").strip()
-                        ),
+                        "text": subevent_text,
+                        "date": subevent_date,
                     }
                 )
+            major_text = normalize_user_text(
+                str(raw_major.get("text") or "").strip()
+            )
+            major_date = normalize_user_text(
+                str(raw_major.get("date") or "").strip()
+            ) or extract_event_date(f"{major_title}\n{major_text}")
             major_events.append(
                 {
                     "id": major_id,
                     "title": major_title,
-                    "text": normalize_user_text(
-                        str(raw_major.get("text") or "").strip()
-                    ),
+                    "text": major_text,
+                    "date": major_date,
                     "subevents": subevents,
                 }
             )
@@ -207,6 +337,61 @@ def normalize_event_histories(raw_histories):
     return histories
 
 
+def normalize_lore_countries(raw_lore_countries):
+    if isinstance(raw_lore_countries, dict):
+        converted = []
+        for name, value in raw_lore_countries.items():
+            if isinstance(value, dict):
+                entry = dict(value)
+                entry.setdefault("name", name)
+            else:
+                entry = {"name": name, "event_histories": value}
+            converted.append(entry)
+        raw_lore_countries = converted
+    if not isinstance(raw_lore_countries, list):
+        return []
+
+    lore_countries = []
+    by_name = {}
+    used_ids = set()
+    for raw_entry in raw_lore_countries:
+        if not isinstance(raw_entry, dict):
+            continue
+        name = normalize_user_text(str(raw_entry.get("name") or "").strip())
+        histories = normalize_event_histories(
+            raw_entry.get("event_histories", [])
+        )
+        if not name or not histories:
+            continue
+        name_key = name.casefold()
+        if name_key in by_name:
+            existing_entry = by_name[name_key]
+            merge_event_histories(
+                existing_entry["event_histories"], histories
+            )
+            if not existing_entry.get("linked_country_id"):
+                existing_entry["linked_country_id"] = (
+                    str(raw_entry.get("linked_country_id") or "").strip()
+                    or None
+                )
+            continue
+        lore_id = str(raw_entry.get("id") or "").strip()
+        while not lore_id or lore_id in used_ids:
+            lore_id = uuid4().hex[:12]
+        used_ids.add(lore_id)
+        entry = {
+            "id": lore_id,
+            "name": name,
+            "linked_country_id": (
+                str(raw_entry.get("linked_country_id") or "").strip() or None
+            ),
+            "event_histories": histories,
+        }
+        by_name[name_key] = entry
+        lore_countries.append(entry)
+    return lore_countries
+
+
 def load_data(data_file=None):
     data_file = data_file or DATA_FILE
     if os.path.exists(data_file):
@@ -222,9 +407,14 @@ def load_data(data_file=None):
                 d["flag_library"], (list, dict)
             ):
                 raise ValueError("Поле flag_library должно быть списком или объектом")
+            if "lore_countries" in d and not isinstance(
+                d["lore_countries"], (list, dict)
+            ):
+                raise ValueError("Поле lore_countries должно быть списком или объектом")
             d.setdefault("admins", [])
             d.setdefault("countries", {})
             d.setdefault("flag_library", [])
+            d.setdefault("lore_countries", [])
 
             normalized_admins = []
             for admin_id in d["admins"]:
@@ -323,6 +513,79 @@ def load_data(data_file=None):
                     )
                 country["regions"] = regions
 
+            lore_countries = normalize_lore_countries(
+                d.get("lore_countries", [])
+            )
+            country_by_id = {
+                country["id"]: country for country in d["countries"].values()
+            }
+            lore_by_id = {entry["id"]: entry for entry in lore_countries}
+            linked_country_ids = set()
+
+            for lore_country in lore_countries:
+                linked_country_id = lore_country.get("linked_country_id")
+                if (
+                    linked_country_id not in country_by_id
+                    or linked_country_id in linked_country_ids
+                ):
+                    lore_country["linked_country_id"] = None
+                    continue
+                linked_country_ids.add(linked_country_id)
+                country_by_id[linked_country_id]["lore_country_id"] = (
+                    lore_country["id"]
+                )
+
+            for country in d["countries"].values():
+                requested_lore_id = str(
+                    country.get("lore_country_id") or ""
+                ).strip()
+                requested_lore = lore_by_id.get(requested_lore_id)
+                if not requested_lore:
+                    country["lore_country_id"] = None
+                    continue
+                linked_country_id = requested_lore.get("linked_country_id")
+                if linked_country_id in (None, country["id"]):
+                    requested_lore["linked_country_id"] = country["id"]
+                    country["lore_country_id"] = requested_lore["id"]
+                    linked_country_ids.add(country["id"])
+                else:
+                    country["lore_country_id"] = None
+
+            for country in d["countries"].values():
+                legacy_histories = country.get("event_histories", [])
+                if not legacy_histories:
+                    country["event_histories"] = []
+                    continue
+                lore_country = lore_by_id.get(country.get("lore_country_id"))
+                if not lore_country:
+                    lore_country = next(
+                        (
+                            entry
+                            for entry in lore_countries
+                            if entry["name"].casefold()
+                            == country["name"].casefold()
+                            and not entry.get("linked_country_id")
+                        ),
+                        None,
+                    )
+                if not lore_country:
+                    lore_country = {
+                        "id": uuid4().hex[:12],
+                        "name": country["name"],
+                        "linked_country_id": None,
+                        "event_histories": [],
+                    }
+                    lore_countries.append(lore_country)
+                    lore_by_id[lore_country["id"]] = lore_country
+                merge_event_histories(
+                    lore_country["event_histories"], legacy_histories
+                )
+                lore_country["linked_country_id"] = country["id"]
+                country["lore_country_id"] = lore_country["id"]
+                country["event_histories"] = []
+
+            d["lore_countries"] = lore_countries
+
             raw_library = d.get("flag_library", [])
             if isinstance(raw_library, dict):
                 raw_library = [
@@ -366,7 +629,12 @@ def load_data(data_file=None):
                 )
             d["flag_library"] = flag_library
             return d
-    return {"admins": [], "countries": {}, "flag_library": []}
+    return {
+        "admins": [],
+        "countries": {},
+        "flag_library": [],
+        "lore_countries": [],
+    }
 
 
 def save_data():
@@ -435,9 +703,10 @@ def is_admin(user_id: int) -> bool:
     ADD_HERB,
     ADD_DESC,
     ADD_LORE,
-) = range(11)
+    ADD_LINK_HISTORY,
+) = range(12)
 
-SEARCH_COUNTRY_QUERY = 11
+SEARCH_COUNTRY_QUERY = 12
 
 (EDIT_CHOOSE_COUNTRY, EDIT_CHOOSE_FIELD, EDIT_VALUE) = range(20, 23)
 
@@ -474,7 +743,11 @@ SEARCH_COUNTRY_QUERY = 11
 
 (RESTORE_BACKUP_FILE, RESTORE_BACKUP_CONFIRM) = range(70, 72)
 
-(ADD_HISTORY_CHOOSE_COUNTRY, ADD_HISTORY_FILE) = range(80, 82)
+(
+    ADD_HISTORY_CHOOSE_COUNTRY,
+    ADD_HISTORY_NEW_COUNTRY_NAME,
+    ADD_HISTORY_FILE,
+) = range(80, 83)
 
 EDIT_FIELDS = {
     "name": "Название",
@@ -525,7 +798,7 @@ def paginated_list_text(text: str, page: int, total_pages: int) -> str:
 
 
 MAJOR_EVENT_PATTERN = re.compile(r"^\s*\[([^\[\]\r\n]+)\]\s*(.*)$")
-YEAR_PATTERN = re.compile(r"\b(?:1\d{3}|20\d{2})\b")
+YEAR_PATTERN = re.compile(rf"\b{EVENT_YEAR_TOKEN}\b")
 
 
 def extract_docx_text(payload: bytes) -> str:
@@ -807,22 +1080,22 @@ def is_chronology_heading(text: str) -> bool:
     if len(compact) > 160 or not YEAR_PATTERN.search(compact):
         return False
     if re.fullmatch(
-        r"(?:1\d{3}|20\d{2})(?:\s*-\s*(?:1\d{3}|20\d{2}))?"
+        rf"{EVENT_YEAR_TOKEN}(?:\s*-\s*{EVENT_YEAR_TOKEN})?"
         r"(?:\s+(?:год|года))?[.:]?",
         compact,
         flags=re.IGNORECASE,
     ):
         return True
-    if re.match(r"^(?:1\d{3}|20\d{2})\s*-", compact):
+    if re.match(rf"^{EVENT_YEAR_TOKEN}\s*-", compact):
         return True
     if re.search(
-        r"\((?:1\d{3}|20\d{2})\s*-\s*(?:(?:1\d{3}|20\d{2})|н\.?\s*в\.?)\)\.?$",
+        rf"\({EVENT_YEAR_TOKEN}\s*-\s*(?:{EVENT_YEAR_TOKEN}|н\.?\s*в\.?)\)\.?$",
         compact,
         flags=re.IGNORECASE,
     ):
         return True
     return bool(
-        re.search(r"(?:1\d{3}|20\d{2})\s*-\s*(?:1\d{3}|20\d{2})", compact)
+        re.search(rf"{EVENT_YEAR_TOKEN}\s*-\s*{EVENT_YEAR_TOKEN}", compact)
         and len(compact) <= 120
     )
 
@@ -982,6 +1255,10 @@ def parse_event_journal_text(text: str):
     )
     if subevents_count > 2000:
         raise ValueError("В одном файле можно сохранить максимум 2000 подсобытий")
+    for major in major_events:
+        major["date"] = event_date(major)
+        for subevent in major.get("subevents", []):
+            subevent["date"] = event_date(subevent)
     return parsed
 
 
@@ -1032,8 +1309,8 @@ def find_subevent(major_event: dict, subevent_id: str):
 def journal_countries_page_keyboard(page=0):
     countries = sorted(
         [
-            (name, country)
-            for name, country in DATA.get("countries", {}).items()
+            (lore_country_display_name(country), country)
+            for country in DATA.get("lore_countries", [])
             if country.get("event_histories")
         ],
         key=lambda item: item[0].casefold(),
@@ -1093,7 +1370,7 @@ def journal_major_events_page_keyboard(country: dict, history: dict, page=0):
     buttons = [
         [
             InlineKeyboardButton(
-                short_button_text(event["title"]),
+                short_button_text(event_title_with_date(event)),
                 callback_data=(
                     f"journalmajor:{country['id']}:{history['id']}:{event['id']}"
                 ),
@@ -1140,7 +1417,7 @@ def journal_subevents_page_keyboard(
     buttons.extend([
         [
             InlineKeyboardButton(
-                short_button_text(event["title"]),
+                short_button_text(event_title_with_date(event)),
                 callback_data=(
                     f"journalsub:{country['id']}:{history['id']}:"
                     f"{major_event['id']}:{event['id']}"
@@ -1235,6 +1512,58 @@ def country_selection_page_keyboard(
     return keyboard, page, total_pages
 
 
+def add_history_lore_countries_keyboard(page=0):
+    lore_countries = available_lore_countries(linked=True)
+    page_countries, page, total_pages = paginate_items(lore_countries, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                lore_country_display_name(lore_country),
+                callback_data=f"addhistorycountry:{lore_country['id']}",
+            )
+        ]
+        for lore_country in page_countries
+    ]
+    navigation = pagination_row(page, total_pages, "addhistorypage")
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "➕ Новая страна только с лором",
+                callback_data="addhistorynew",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(buttons), page, total_pages
+
+
+def new_country_lore_link_keyboard(page=0):
+    lore_countries = available_lore_countries(linked=False)
+    page_countries, page, total_pages = paginate_items(lore_countries, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                lore_country["name"],
+                callback_data=f"addcountrylore:{lore_country['id']}",
+            )
+        ]
+        for lore_country in page_countries
+    ]
+    navigation = pagination_row(page, total_pages, "addcountrylorepage")
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "Не привязывать",
+                callback_data="addcountrylore:skip",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(buttons), page, total_pages
+
+
 def get_country_by_id(country_id: str):
     """Возвращает текущее имя страны и данные по короткому внутреннему ID."""
     for name, country in DATA["countries"].items():
@@ -1249,6 +1578,86 @@ def get_country_by_name(country_name: str):
         if name.casefold() == wanted:
             return name, country
     return None, None
+
+
+def get_lore_country_by_id(lore_country_id: str):
+    for lore_country in DATA.get("lore_countries", []):
+        if lore_country.get("id") == lore_country_id:
+            return lore_country
+    return None
+
+
+def get_lore_country_by_name(country_name: str):
+    wanted = normalize_user_text(country_name.strip()).casefold()
+    return next(
+        (
+            lore_country
+            for lore_country in DATA.get("lore_countries", [])
+            if lore_country.get("name", "").casefold() == wanted
+        ),
+        None,
+    )
+
+
+def get_lore_for_country(country: dict):
+    if not country:
+        return None
+    lore_country = get_lore_country_by_id(country.get("lore_country_id"))
+    if lore_country:
+        return lore_country
+    return next(
+        (
+            entry
+            for entry in DATA.get("lore_countries", [])
+            if entry.get("linked_country_id") == country.get("id")
+        ),
+        None,
+    )
+
+
+def lore_country_display_name(lore_country: dict) -> str:
+    if not lore_country:
+        return "Страна"
+    linked_name, linked_country = get_country_by_id(
+        lore_country.get("linked_country_id")
+    )
+    return linked_name if linked_country else lore_country.get("name") or "Страна"
+
+
+def get_journal_country(identifier: str):
+    lore_country = get_lore_country_by_id(identifier)
+    if lore_country:
+        return lore_country_display_name(lore_country), lore_country
+    country_name, country = get_country_by_id(identifier)
+    lore_country = get_lore_for_country(country)
+    if lore_country:
+        return country_name, lore_country
+    return None, None
+
+
+def link_lore_country(country: dict, lore_country: dict):
+    if not country or not lore_country:
+        return
+    old_lore = get_lore_for_country(country)
+    if old_lore and old_lore.get("id") != lore_country.get("id"):
+        old_lore["linked_country_id"] = None
+    old_country_id = lore_country.get("linked_country_id")
+    if old_country_id and old_country_id != country.get("id"):
+        _, old_country = get_country_by_id(old_country_id)
+        if old_country:
+            old_country["lore_country_id"] = None
+    lore_country["linked_country_id"] = country["id"]
+    country["lore_country_id"] = lore_country["id"]
+
+
+def available_lore_countries(linked=False):
+    entries = [
+        entry
+        for entry in DATA.get("lore_countries", [])
+        if entry.get("event_histories")
+        and (linked or not entry.get("linked_country_id"))
+    ]
+    return sorted(entries, key=lambda item: item["name"].casefold())
 
 
 def search_countries(search_text: str):
@@ -1916,12 +2325,13 @@ def info_buttons(c: dict):
                 )
             ]
         )
-    if c.get("event_histories"):
+    lore_country = get_lore_for_country(c)
+    if lore_country and lore_country.get("event_histories"):
         rows.append(
             [
                 InlineKeyboardButton(
                     "📜 Журнал событий",
-                    callback_data=f"journalcountry:{c['id']}",
+                    callback_data=f"journalcountry:{lore_country['id']}",
                 )
             ]
         )
@@ -2125,7 +2535,7 @@ async def cb_journal_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def show_journal_country(query, country_id: str, page=0):
-    country_name, country = get_country_by_id(country_id)
+    country_name, country = get_journal_country(country_id)
     if not country or not country.get("event_histories"):
         await query.edit_message_text(
             "Похоже, у этой страны больше нет загруженных историй",
@@ -2170,7 +2580,7 @@ async def cb_journal_country_page(
 async def show_journal_history(
     query, country_id: str, history_id: str, page=0
 ):
-    country_name, country = get_country_by_id(country_id)
+    country_name, country = get_journal_country(country_id)
     history = find_event_history(country, history_id)
     if not country or not history:
         await query.edit_message_text(
@@ -2224,7 +2634,7 @@ async def cb_journal_history_page(
 async def show_journal_major_event(
     query, country_id: str, history_id: str, major_id: str, page=0
 ):
-    _, country = get_country_by_id(country_id)
+    _, country = get_journal_country(country_id)
     history = find_event_history(country, history_id)
     major_event = find_major_event(history, major_id)
     if not country or not history or not major_event:
@@ -2239,7 +2649,7 @@ async def show_journal_major_event(
     if not major_event.get("subevents"):
         await send_journal_detail(
             query.message,
-            major_event["title"],
+            event_title_with_date(major_event),
             major_event.get("text") or "У этого события пока нет отдельного описания",
             "⬅️ К большим событиям",
             f"journalhistory:{country_id}:{history_id}",
@@ -2250,7 +2660,7 @@ async def show_journal_major_event(
         country, history, major_event, page
     )
     text = (
-        f"<b>{escape(major_event['title'])}</b>"
+        f"<b>{escape(event_title_with_date(major_event))}</b>"
         f"{journal_menu_excerpt(major_event.get('text'))}\n\n"
         "Выбирай подсобытие:"
     )
@@ -2302,7 +2712,7 @@ async def cb_journal_major_text(
     except ValueError:
         await query.message.reply_text("Эта кнопка почему-то сломалась")
         return
-    _, country = get_country_by_id(country_id)
+    _, country = get_journal_country(country_id)
     history = find_event_history(country, history_id)
     major_event = find_major_event(history, major_id)
     if not country or not history or not major_event:
@@ -2310,7 +2720,7 @@ async def cb_journal_major_text(
         return
     await send_journal_detail(
         query.message,
-        major_event["title"],
+        event_title_with_date(major_event),
         major_event.get("text") or "У этого события пока нет отдельного описания",
         "⬅️ К подсобытиям",
         f"journalmajor:{country_id}:{history_id}:{major_id}",
@@ -2329,7 +2739,7 @@ async def cb_journal_subevent(
     except ValueError:
         await query.message.reply_text("Эта кнопка почему-то сломалась")
         return
-    _, country = get_country_by_id(country_id)
+    _, country = get_journal_country(country_id)
     history = find_event_history(country, history_id)
     major_event = find_major_event(history, major_id)
     subevent = find_subevent(major_event, subevent_id)
@@ -2338,7 +2748,7 @@ async def cb_journal_subevent(
         return
     await send_journal_detail(
         query.message,
-        subevent["title"],
+        event_title_with_date(subevent),
         subevent.get("text") or "У этого подсобытия пока нет отдельного описания",
         "⬅️ К подсобытиям",
         f"journalmajor:{country_id}:{history_id}:{major_id}",
@@ -2843,6 +3253,7 @@ async def cmd_addadmin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def database_counts(data: dict):
     countries_count = len(data.get("countries", {}))
+    lore_countries_count = len(data.get("lore_countries", []))
     regions_count = sum(
         len(country.get("regions", []))
         for country in data.get("countries", {}).values()
@@ -2850,9 +3261,15 @@ def database_counts(data: dict):
     flags_count = len(data.get("flag_library", []))
     histories_count = sum(
         len(country.get("event_histories", []))
-        for country in data.get("countries", {}).values()
+        for country in data.get("lore_countries", [])
     )
-    return countries_count, regions_count, flags_count, histories_count
+    return (
+        countries_count,
+        lore_countries_count,
+        regions_count,
+        flags_count,
+        histories_count,
+    )
 
 
 def clear_restore_context(context: ContextTypes.DEFAULT_TYPE):
@@ -2875,12 +3292,19 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не-а, эта команда только для админов")
         return
 
-    countries_count, regions_count, flags_count, histories_count = database_counts(DATA)
+    (
+        countries_count,
+        lore_countries_count,
+        regions_count,
+        flags_count,
+        histories_count,
+    ) = database_counts(DATA)
     await send_database_backup(
         update.message,
         (
             "Готово, вот свежая резервная копия\n\n"
             f"Стран: {countries_count}\n"
+            f"Стран с лором: {lore_countries_count}\n"
             f"Регионов: {regions_count}\n"
             f"Флагов: {flags_count}\n"
             f"Историй: {histories_count}"
@@ -2925,9 +3349,13 @@ async def restore_backup_file(
         )
         return RESTORE_BACKUP_FILE
 
-    countries_count, regions_count, flags_count, histories_count = database_counts(
-        restored_data
-    )
+    (
+        countries_count,
+        lore_countries_count,
+        regions_count,
+        flags_count,
+        histories_count,
+    ) = database_counts(restored_data)
     context.user_data["restore_backup_data"] = restored_data
     buttons = [[
         InlineKeyboardButton("Восстановить", callback_data="restorebackup:yes"),
@@ -2936,6 +3364,7 @@ async def restore_backup_file(
     await update.message.reply_text(
         "Копия выглядит нормально\n\n"
         f"Стран: {countries_count}\n"
+        f"Стран с лором: {lore_countries_count}\n"
         f"Регионов: {regions_count}\n"
         f"Флагов: {flags_count}\n"
         f"Историй: {histories_count}\n\n"
@@ -2980,11 +3409,18 @@ async def restore_backup_confirm(
     DATA.update(restored_data)
     sync_entity_flags_to_library()
     save_data()
-    countries_count, regions_count, flags_count, histories_count = database_counts(DATA)
+    (
+        countries_count,
+        lore_countries_count,
+        regions_count,
+        flags_count,
+        histories_count,
+    ) = database_counts(DATA)
     clear_restore_context(context)
     await query.edit_message_text(
         "Готово, базу восстановил\n\n"
         f"Стран: {countries_count}\n"
+        f"Стран с лором: {lore_countries_count}\n"
         f"Регионов: {regions_count}\n"
         f"Флагов: {flags_count}\n"
         f"Историй: {histories_count}"
@@ -2997,7 +3433,23 @@ async def restore_backup_confirm(
 # ---------------------------------------------------------------------------
 
 def clear_history_context(context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.pop("history_country_id", None)
+    context.user_data.pop("history_lore_country_id", None)
+    context.user_data.pop("history_new_country_name", None)
+
+
+async def send_history_file_prompt(message, country_name: str):
+    await message.reply_text(
+        f'Скинь историю страны "{country_name}" файлом DOCX, TXT, MD или PDF\n\n'
+        "Название файла станет названием истории\n\n"
+        "Если [] и {} уже расставлены, бот использует их\n"
+        "Если скобок нет, попробует сам найти даты и заголовки\n\n"
+        "[] - большое событие\n"
+        "{} - подсобытие, внутри может быть название или весь текст\n\n"
+        "[Большое событие]\n"
+        "Текст большого события\n\n"
+        "{Дата - подсобытие}\n"
+        "Текст подсобытия"
+    )
 
 
 async def add_history_start(
@@ -3006,19 +3458,12 @@ async def add_history_start(
     if not is_admin(update.effective_user.id):
         await update.message.reply_text("Не-а, эта команда только для админов")
         return ConversationHandler.END
-    if not DATA.get("countries"):
-        await update.message.reply_text(
-            "Сначала нужна хотя бы одна страна - добавь её через /addcountry"
-        )
-        return ConversationHandler.END
 
     clear_history_context(context)
-    kb, page, total_pages = country_selection_page_keyboard(
-        "addhistorycountry", "addhistorypage"
-    )
+    kb, page, total_pages = add_history_lore_countries_keyboard()
     await update.message.reply_text(
         paginated_list_text(
-            "К какой стране добавить историю?", page, total_pages
+            "Для какой страны загружаем лор?", page, total_pages
         ),
         reply_markup=kb,
     )
@@ -3031,12 +3476,10 @@ async def add_history_country_page(
     query = update.callback_query
     await query.answer()
     page = int(query.data.rsplit(":", 1)[1])
-    kb, page, total_pages = country_selection_page_keyboard(
-        "addhistorycountry", "addhistorypage", page
-    )
+    kb, page, total_pages = add_history_lore_countries_keyboard(page)
     await query.edit_message_text(
         paginated_list_text(
-            "К какой стране добавить историю?", page, total_pages
+            "Для какой страны загружаем лор?", page, total_pages
         ),
         reply_markup=kb,
     )
@@ -3048,40 +3491,76 @@ async def add_history_choose_country(
 ):
     query = update.callback_query
     await query.answer()
-    country_id = query.data.split(":", 1)[1]
-    country_name, country = get_country_by_id(country_id)
-    if not country:
-        await query.message.reply_text("Похоже, этой страны уже нет")
+    lore_country_id = query.data.split(":", 1)[1]
+    lore_country = get_lore_country_by_id(lore_country_id)
+    if not lore_country:
+        await query.message.reply_text("Похоже, этого лора уже нет")
         clear_history_context(context)
         return ConversationHandler.END
 
-    context.user_data["history_country_id"] = country_id
-    await query.message.reply_text(
-        f'Скинь историю страны "{country_name}" файлом DOCX, TXT, MD или PDF\n\n'
-        "Название файла станет названием истории\n\n"
-        "Если [] и {} уже расставлены, бот использует их\n"
-        "Если скобок нет, попробует сам найти даты и заголовки\n\n"
-        "[] - большое событие\n"
-        "{} - подсобытие, внутри может быть название или весь текст\n\n"
-        "[Большое событие]\n"
-        "Текст большого события\n\n"
-        "{Дата - подсобытие}\n"
-        "Текст подсобытия"
+    context.user_data["history_lore_country_id"] = lore_country_id
+    context.user_data.pop("history_new_country_name", None)
+    await send_history_file_prompt(
+        query.message, lore_country_display_name(lore_country)
     )
+    return ADD_HISTORY_FILE
+
+
+async def add_history_new_country_prompt(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("history_lore_country_id", None)
+    context.user_data.pop("history_new_country_name", None)
+    await query.message.reply_text(
+        "Напиши название страны для журнала\n\n"
+        "Карточка и другая информация для этого не нужны"
+    )
+    return ADD_HISTORY_NEW_COUNTRY_NAME
+
+
+async def add_history_new_country_name(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    country_name = normalize_user_text(update.message.text or "").strip()
+    if not country_name:
+        await update.message.reply_text("Название не должно быть пустым")
+        return ADD_HISTORY_NEW_COUNTRY_NAME
+    if len(country_name) > 100:
+        await update.message.reply_text(
+            "Название длиннее 100 символов - давай немного короче"
+        )
+        return ADD_HISTORY_NEW_COUNTRY_NAME
+    existing_lore = get_lore_country_by_name(country_name)
+    if existing_lore:
+        context.user_data["history_lore_country_id"] = existing_lore["id"]
+        context.user_data.pop("history_new_country_name", None)
+        await update.message.reply_text(
+            "Такая страна в журнале уже есть - добавлю историю туда"
+        )
+    else:
+        context.user_data["history_new_country_name"] = country_name
+        context.user_data.pop("history_lore_country_id", None)
+    await send_history_file_prompt(update.message, country_name)
     return ADD_HISTORY_FILE
 
 
 async def add_history_file(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
-    country_id = context.user_data.get("history_country_id")
-    country_name, country = get_country_by_id(country_id)
-    if not country:
+    lore_country_id = context.user_data.get("history_lore_country_id")
+    country = get_lore_country_by_id(lore_country_id)
+    pending_country_name = context.user_data.get("history_new_country_name")
+    if not country and not pending_country_name:
         await update.message.reply_text(
-            "Страна куда-то пропала - запусти /addhistory заново"
+            "Страна для лора куда-то пропала - запусти /addhistory заново"
         )
         clear_history_context(context)
         return ConversationHandler.END
+    country_name = (
+        lore_country_display_name(country) if country else pending_country_name
+    )
 
     document = update.message.document
     if not document:
@@ -3122,6 +3601,26 @@ async def add_history_file(
         )
         return ADD_HISTORY_FILE
 
+    linked_to_card = False
+    if not country:
+        country = {
+            "id": uuid4().hex[:12],
+            "name": pending_country_name,
+            "linked_country_id": None,
+            "event_histories": [],
+        }
+        _, info_country = get_country_by_name(pending_country_name)
+        if info_country and not get_lore_for_country(info_country):
+            country["linked_country_id"] = info_country["id"]
+            info_country["lore_country_id"] = country["id"]
+            linked_to_card = True
+        DATA.setdefault("lore_countries", []).append(country)
+    elif not country.get("linked_country_id"):
+        _, info_country = get_country_by_name(country["name"])
+        if info_country and not get_lore_for_country(info_country):
+            link_lore_country(info_country, country)
+            linked_to_card = True
+
     histories = country.setdefault("event_histories", [])
     existing_history = next(
         (
@@ -3157,6 +3656,10 @@ async def add_history_file(
         len(event.get("subevents", []))
         for event in history["major_events"]
     )
+    all_events = list(history["major_events"])
+    for major_event in history["major_events"]:
+        all_events.extend(major_event.get("subevents", []))
+    dated_events_count = sum(bool(event_date(event)) for event in all_events)
     parser_label = (
         "по [] и {}"
         if parsed["parser_mode"] == "markers"
@@ -3166,7 +3669,9 @@ async def add_history_file(
         f'Готово! Историю "{title}" {action} для страны "{country_name}"\n\n'
         f"Больших событий: {len(history['major_events'])}\n"
         f"Подсобытий: {subevents_count}\n"
+        f"Дат найдено: {dated_events_count} из {len(all_events)}\n"
         f"Разбор: {parser_label}"
+        + ("\nПривязал историю к карточке страны" if linked_to_card else "")
     )
     clear_history_context(context)
     return ConversationHandler.END
@@ -3371,17 +3876,99 @@ async def add_lore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_country"]["lore_links"] = links
 
     c = context.user_data["new_country"]
-    DATA["countries"][c["name"]] = c
+    c["lore_country_id"] = None
+    candidates = available_lore_countries(linked=False)
+    if candidates:
+        kb, page, total_pages = new_country_lore_link_keyboard()
+        await update.message.reply_text(
+            paginated_list_text(
+                f'Привязать к стране "{c["name"]}" уже загруженную историю?',
+                page,
+                total_pages,
+            ),
+            reply_markup=kb,
+        )
+        return ADD_LINK_HISTORY
+
+    finalize_new_country(c)
+    await update.message.reply_text(f'Готово! Страна "{c["name"]}" теперь в боте')
+    context.user_data.pop("new_country", None)
+    return ConversationHandler.END
+
+
+def finalize_new_country(country: dict, lore_country=None):
+    DATA["countries"][country["name"]] = country
+    if lore_country:
+        link_lore_country(country, lore_country)
     upsert_library_flag(
-        c["name"],
-        c["flag_file_id"],
-        c.get("flag_media_type", "document"),
+        country["name"],
+        country["flag_file_id"],
+        country.get("flag_media_type", "document"),
         flag_type="country",
-        country_id=c.get("id"),
+        country_id=country.get("id"),
     )
     save_data()
 
-    await update.message.reply_text(f"Готово! Страна \"{c['name']}\" теперь в боте")
+
+async def add_country_lore_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    country = context.user_data.get("new_country")
+    if not country:
+        await query.edit_message_text("Данные страны потерялись - начни заново")
+        return ConversationHandler.END
+    page = int(query.data.rsplit(":", 1)[1])
+    kb, page, total_pages = new_country_lore_link_keyboard(page)
+    await query.edit_message_text(
+        paginated_list_text(
+            f'Привязать к стране "{country["name"]}" уже загруженную историю?',
+            page,
+            total_pages,
+        ),
+        reply_markup=kb,
+    )
+    return ADD_LINK_HISTORY
+
+
+async def add_country_link_history(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    country = context.user_data.get("new_country")
+    if not country:
+        await query.edit_message_text("Данные страны потерялись - начни заново")
+        return ConversationHandler.END
+    choice = query.data.split(":", 1)[1]
+    if choice == "skip":
+        finalize_new_country(country)
+        await query.edit_message_text(
+            f'Готово! Страна "{country["name"]}" теперь в боте\n\n'
+            "Историю пока не привязывал"
+        )
+        context.user_data.pop("new_country", None)
+        return ConversationHandler.END
+
+    lore_country = get_lore_country_by_id(choice)
+    if not lore_country or lore_country.get("linked_country_id"):
+        kb, page, total_pages = new_country_lore_link_keyboard()
+        await query.edit_message_text(
+            paginated_list_text(
+                "Эта история уже недоступна - выбери другую",
+                page,
+                total_pages,
+            ),
+            reply_markup=kb,
+        )
+        return ADD_LINK_HISTORY
+
+    finalize_new_country(country, lore_country)
+    await query.edit_message_text(
+        f'Готово! Страна "{country["name"]}" теперь в боте\n\n'
+        f'Историю страны "{lore_country["name"]}" тоже привязал'
+    )
     context.user_data.pop("new_country", None)
     return ConversationHandler.END
 
@@ -3419,9 +4006,19 @@ add_history_conv = ConversationHandler(
                 pattern=r"^addhistorycountry:[^:]+$",
             ),
             CallbackQueryHandler(
+                add_history_new_country_prompt,
+                pattern=r"^addhistorynew$",
+            ),
+            CallbackQueryHandler(
                 add_history_country_page,
                 pattern=r"^addhistorypage:\d+$",
             ),
+        ],
+        ADD_HISTORY_NEW_COUNTRY_NAME: [
+            MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                add_history_new_country_name,
+            )
         ],
         ADD_HISTORY_FILE: [
             MessageHandler(filters.Document.ALL & ~filters.COMMAND, add_history_file)
@@ -3469,6 +4066,16 @@ add_country_conv = ConversationHandler(
         ],
         ADD_DESC: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_desc)],
         ADD_LORE: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_lore)],
+        ADD_LINK_HISTORY: [
+            CallbackQueryHandler(
+                add_country_link_history,
+                pattern=r"^addcountrylore:(?:skip|[^:]+)$",
+            ),
+            CallbackQueryHandler(
+                add_country_lore_page,
+                pattern=r"^addcountrylorepage:\d+$",
+            ),
+        ],
     },
     fallbacks=[CommandHandler("cancel", cancel)],
 )
