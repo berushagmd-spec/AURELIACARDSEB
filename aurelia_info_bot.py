@@ -15,14 +15,20 @@ Telegram-бот для каталога стран вселенной Аурел
 """
 
 import json
+import io
 import logging
 import os
 import random
+import re
 import tempfile
+import xml.etree.ElementTree as ET
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from html import escape
 from uuid import uuid4
+from zipfile import BadZipFile, ZipFile
 
+from pypdf import PdfReader
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -57,7 +63,7 @@ BOT_TOKEN = os.environ.get("BOT_TOKEN", "PASTE_YOUR_TOKEN_HERE")
 MAIN_ADMIN_ID = 7787565361
 
 # Версии ведём в формате MAJOR.MINOR.PATCH
-BOT_VERSION = "1.4.0"
+BOT_VERSION = "1.5.1"
 
 DATA_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.json")
 STICKER_SET_NAME = "AureliaPack"
@@ -74,6 +80,131 @@ def normalize_user_text(text: str) -> str:
     for quote in ("\u00ab", "\u00bb", "\u201c", "\u201d", "\u201e", "\u201f"):
         text = text.replace(quote, '"')
     return text
+
+
+def normalize_area_value(text: str) -> str:
+    value = normalize_user_text(text or "").strip().casefold()
+    for suffix in ("км²", "км2", "кв. км", "кв км"):
+        if value.endswith(suffix):
+            value = value[:-len(suffix)].strip()
+            break
+    value = value.replace("\u00a0", "").replace(" ", "")
+    if not re.fullmatch(r"\d+(?:[.,]\d+)?", value):
+        raise ValueError("Площадь нужно написать числом")
+    try:
+        if Decimal(value.replace(",", ".")) <= 0:
+            raise ValueError("Площадь должна быть больше нуля")
+    except InvalidOperation as error:
+        raise ValueError("Площадь нужно написать числом") from error
+    return value.replace(".", ",")
+
+
+def parse_borders_value(text: str):
+    value = normalize_user_text(text or "").strip()
+    if value.casefold() in ("нет", "-", "no"):
+        return []
+    borders = []
+    used_names = set()
+    for item in re.split(r"[,;\n]+", value):
+        name = item.strip()
+        if name and name.casefold() not in used_names:
+            used_names.add(name.casefold())
+            borders.append(name)
+    return borders
+
+
+def clean_journal_text(lines) -> str:
+    text = "\n".join(lines).strip()
+    return re.sub(r"\n{3,}", "\n\n", text)
+
+
+def normalize_event_histories(raw_histories):
+    if not isinstance(raw_histories, list):
+        return []
+    histories = []
+    used_history_ids = set()
+    for raw_history in raw_histories:
+        if not isinstance(raw_history, dict):
+            continue
+        title = normalize_user_text(str(raw_history.get("title") or "").strip())
+        if not title:
+            continue
+        history_id = str(raw_history.get("id") or "").strip()
+        while not history_id or history_id in used_history_ids:
+            history_id = uuid4().hex[:12]
+        used_history_ids.add(history_id)
+
+        major_events = []
+        used_major_ids = set()
+        for raw_major in raw_history.get("major_events", []):
+            if not isinstance(raw_major, dict):
+                continue
+            major_title = normalize_user_text(
+                str(raw_major.get("title") or "").strip()
+            )
+            if not major_title:
+                continue
+            major_id = str(raw_major.get("id") or "").strip()
+            while not major_id or major_id in used_major_ids:
+                major_id = uuid4().hex[:12]
+            used_major_ids.add(major_id)
+
+            subevents = []
+            used_subevent_ids = set()
+            for raw_subevent in raw_major.get("subevents", []):
+                if not isinstance(raw_subevent, dict):
+                    continue
+                subevent_title = normalize_user_text(
+                    str(raw_subevent.get("title") or "").strip()
+                )
+                if not subevent_title:
+                    continue
+                subevent_id = str(raw_subevent.get("id") or "").strip()
+                while not subevent_id or subevent_id in used_subevent_ids:
+                    subevent_id = uuid4().hex[:12]
+                used_subevent_ids.add(subevent_id)
+                subevents.append(
+                    {
+                        "id": subevent_id,
+                        "title": subevent_title,
+                        "text": normalize_user_text(
+                            str(raw_subevent.get("text") or "").strip()
+                        ),
+                    }
+                )
+            major_events.append(
+                {
+                    "id": major_id,
+                    "title": major_title,
+                    "text": normalize_user_text(
+                        str(raw_major.get("text") or "").strip()
+                    ),
+                    "subevents": subevents,
+                }
+            )
+        if not major_events:
+            continue
+        histories.append(
+            {
+                "id": history_id,
+                "title": title,
+                "intro": normalize_user_text(
+                    str(raw_history.get("intro") or "").strip()
+                ),
+                "source_filename": normalize_user_text(
+                    str(raw_history.get("source_filename") or "").strip()
+                ),
+                "source_file_id": raw_history.get("source_file_id"),
+                "uploaded_at": raw_history.get("uploaded_at"),
+                "parser_mode": (
+                    raw_history.get("parser_mode")
+                    if raw_history.get("parser_mode") in ("markers", "automatic")
+                    else "markers"
+                ),
+                "major_events": major_events,
+            }
+        )
+    return histories
 
 
 def load_data(data_file=None):
@@ -115,19 +246,27 @@ def load_data(data_file=None):
                     str(country.get("name") or stored_name).strip()
                 )
                 country["name"] = country_name
-                for field in ("leader", "capital", "description"):
+                for field in ("leader", "capital", "description", "area_km2"):
                     if isinstance(country.get(field), str):
                         country[field] = normalize_user_text(country[field])
                 if country.get("flag_file_id"):
                     country["flag_media_type"] = (
                         country.get("flag_media_type") or "document"
                     )
-                for field in ("continents", "lore_links"):
+                for field in ("continents", "lore_links", "borders"):
                     if isinstance(country.get(field), list):
                         country[field] = [
                             normalize_user_text(item) if isinstance(item, str) else item
                             for item in country[field]
                         ]
+                country["area_km2"] = str(country.get("area_km2") or "").strip()
+                raw_borders = country.get("borders", [])
+                if isinstance(raw_borders, str):
+                    raw_borders = parse_borders_value(raw_borders)
+                country["borders"] = raw_borders if isinstance(raw_borders, list) else []
+                country["event_histories"] = normalize_event_histories(
+                    country.get("event_histories", [])
+                )
                 normalized_countries[country_name] = country
             d["countries"] = normalized_countries
 
@@ -290,13 +429,15 @@ def is_admin(user_id: int) -> bool:
     ADD_LEADER,
     ADD_CAPITAL,
     ADD_CONTINENT,
+    ADD_AREA,
+    ADD_BORDERS,
     ADD_FLAG,
     ADD_HERB,
     ADD_DESC,
     ADD_LORE,
-) = range(9)
+) = range(11)
 
-SEARCH_COUNTRY_QUERY = 10
+SEARCH_COUNTRY_QUERY = 11
 
 (EDIT_CHOOSE_COUNTRY, EDIT_CHOOSE_FIELD, EDIT_VALUE) = range(20, 23)
 
@@ -333,11 +474,15 @@ SEARCH_COUNTRY_QUERY = 10
 
 (RESTORE_BACKUP_FILE, RESTORE_BACKUP_CONFIRM) = range(70, 72)
 
+(ADD_HISTORY_CHOOSE_COUNTRY, ADD_HISTORY_FILE) = range(80, 82)
+
 EDIT_FIELDS = {
     "name": "Название",
     "leader": "Лидер",
     "capital": "Столица",
     "continents": "Континент(ы)",
+    "area_km2": "Площадь",
+    "borders": "Границы",
     "card": "Карточка (картинка)",
     "flag": "Флаг",
     "herb": "Герб",
@@ -379,6 +524,654 @@ def paginated_list_text(text: str, page: int, total_pages: int) -> str:
     return f"{text}\n\nСтраница {page + 1} из {total_pages}"
 
 
+MAJOR_EVENT_PATTERN = re.compile(r"^\s*\[([^\[\]\r\n]+)\]\s*(.*)$")
+YEAR_PATTERN = re.compile(r"\b(?:1\d{3}|20\d{2})\b")
+
+
+def extract_docx_text(payload: bytes) -> str:
+    try:
+        with ZipFile(io.BytesIO(payload)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except (BadZipFile, KeyError) as error:
+        raise ValueError("Этот DOCX не получилось открыть") from error
+
+    try:
+        root = ET.fromstring(document_xml)
+    except ET.ParseError as error:
+        raise ValueError("Внутри DOCX сломана структура документа") from error
+
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs = []
+    for paragraph in root.iter(f"{namespace}p"):
+        parts = []
+        for node in paragraph.iter():
+            if node.tag == f"{namespace}t":
+                parts.append(node.text or "")
+            elif node.tag == f"{namespace}tab":
+                parts.append("\t")
+            elif node.tag in (f"{namespace}br", f"{namespace}cr"):
+                parts.append("\n")
+        paragraphs.append("".join(parts))
+    # Word хранит каждый абзац отдельным узлом. Двойной перенос сохраняет эту
+    # структуру и помогает отличить короткий заголовок от следующего текста.
+    return "\n\n".join(paragraphs)
+
+
+def extract_txt_text(payload: bytes) -> str:
+    encodings = ["utf-8-sig"]
+    if payload.startswith((b"\xff\xfe", b"\xfe\xff")):
+        encodings.insert(0, "utf-16")
+    encodings.append("cp1251")
+    for encoding in encodings:
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("Не получилось определить кодировку TXT")
+
+
+def extract_pdf_text(payload: bytes) -> str:
+    try:
+        reader = PdfReader(io.BytesIO(payload))
+    except Exception as error:
+        raise ValueError("Этот PDF не получилось открыть") from error
+
+    paragraphs = []
+    for page in reader.pages:
+        try:
+            page_text = page.extract_text(extraction_mode="layout") or ""
+        except Exception:
+            page_text = page.extract_text() or ""
+        for block in re.split(r"\n\s*\n", page_text):
+            lines = [" ".join(line.split()) for line in block.splitlines()]
+            paragraph = " ".join(line for line in lines if line).strip()
+            if paragraph:
+                paragraphs.append(paragraph)
+    if not paragraphs:
+        raise ValueError("В PDF не нашлось читаемого текста")
+    return "\n\n".join(paragraphs)
+
+
+def extract_history_text(filename: str, payload: bytes) -> str:
+    extension = os.path.splitext(filename or "")[1].casefold()
+    if extension == ".docx":
+        return extract_docx_text(payload)
+    if extension == ".txt":
+        return extract_txt_text(payload)
+    if extension == ".md":
+        return extract_txt_text(payload)
+    if extension == ".pdf":
+        return extract_pdf_text(payload)
+    raise ValueError("Поддерживаются файлы DOCX, TXT, MD и PDF")
+
+
+def strip_journal_markers(text: str) -> str:
+    text = normalize_user_text(text or "")
+    return (
+        text.replace("[", "")
+        .replace("]", "")
+        .replace("{", "")
+        .replace("}", "")
+        .strip()
+    )
+
+
+def marker_title_looks_like_heading(title: str) -> bool:
+    title = strip_journal_markers(title)
+    letters = [char for char in title if char.isalpha()]
+    uppercase_ratio = (
+        sum(char.isupper() for char in letters) / len(letters)
+        if letters
+        else 0
+    )
+    return uppercase_ratio >= 0.7 or (
+        bool(YEAR_PATTERN.search(title)) and (":" in title or "-" in title)
+    )
+
+
+def prepare_journal_lines(text: str):
+    prepared = []
+    for raw_line in normalize_user_text(text or "").replace("\r", "").split("\n"):
+        segments = re.sub(r"\]\s+(?=\[)", "]\n", raw_line).split("\n")
+        for segment in segments:
+            trailing_marker = re.search(
+                r"\s+(\[([^\[\]\n]{1,200})\])\s*$", segment
+            )
+            if trailing_marker and trailing_marker.start() > 0:
+                prefix = segment[:trailing_marker.start()].rstrip()
+                marker_title = trailing_marker.group(2)
+                if prefix.endswith("}") or marker_title_looks_like_heading(
+                    marker_title
+                ):
+                    prepared.append(prefix)
+                    prepared.append(trailing_marker.group(1))
+                    continue
+            prepared.append(segment.rstrip())
+    return prepared
+
+
+def tokenize_structured_journal(text: str):
+    lines = prepare_journal_lines(text)
+    tokens = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        index += 1
+        stripped = line.strip()
+        major_match = MAJOR_EVENT_PATTERN.match(stripped)
+        if major_match:
+            title = major_match.group(1).strip()
+            trailing_text = major_match.group(2).strip()
+            if not trailing_text or marker_title_looks_like_heading(title):
+                tokens.append(("major", title))
+                if trailing_text:
+                    lines.insert(index, trailing_text)
+                continue
+
+        if stripped.startswith("{"):
+            content_parts = []
+            current_part = stripped[1:]
+            while True:
+                if "}" in current_part:
+                    before_close, after_close = current_part.split("}", 1)
+                    content_parts.append(before_close)
+                    if after_close.strip():
+                        lines.insert(index, after_close.strip())
+                    break
+                content_parts.append(current_part)
+                if index >= len(lines):
+                    break
+                possible_next = lines[index]
+                next_major = MAJOR_EVENT_PATTERN.match(possible_next.strip())
+                if next_major and not next_major.group(2).strip():
+                    break
+                current_part = possible_next.strip()
+                index += 1
+            tokens.append(("curly", clean_journal_text(content_parts)))
+            continue
+
+        tokens.append(("text", line))
+    return tokens
+
+
+def curly_block_is_title(content: str) -> bool:
+    compact = " ".join((content or "").split())
+    return (
+        bool(compact)
+        and len(compact) <= 160
+        and len(compact.split()) <= 18
+        and not compact.endswith((".", "!", "?"))
+    )
+
+
+def derive_event_title(text: str, fallback="Событие") -> str:
+    compact = " ".join(strip_journal_markers(text).split())
+    if not compact:
+        return fallback
+    first_sentence = re.split(r"(?<=[.!?])\s+", compact, maxsplit=1)[0]
+    first_clause = re.split(r"[,;]", first_sentence, maxsplit=1)[0].strip()
+    candidate = (
+        first_clause
+        if YEAR_PATTERN.search(first_clause) and len(first_clause) <= 100
+        else first_sentence
+    )
+    if len(candidate) > 100:
+        candidate = f"{candidate[:97].rstrip()}..."
+    return candidate or fallback
+
+
+def parse_structured_journal(tokens):
+    intro_lines = []
+    major_events = []
+    current_major = None
+    current_subevent = None
+
+    for token_type, token_value in tokens:
+        if token_type == "major":
+            title = strip_journal_markers(token_value)
+            if not title:
+                continue
+            current_major = {
+                "id": uuid4().hex[:12],
+                "title": title[:200],
+                "_lines": [],
+                "subevents": [],
+            }
+            major_events.append(current_major)
+            current_subevent = None
+            continue
+
+        if token_type == "curly":
+            if not current_major:
+                intro_lines.append(strip_journal_markers(token_value))
+                continue
+            clean_content = strip_journal_markers(token_value)
+            if not clean_content:
+                continue
+            if curly_block_is_title(clean_content):
+                current_subevent = {
+                    "id": uuid4().hex[:12],
+                    "title": clean_content[:200],
+                    "_lines": [],
+                    "_title_only": True,
+                }
+            else:
+                current_subevent = {
+                    "id": uuid4().hex[:12],
+                    "title": derive_event_title(clean_content),
+                    "_lines": [clean_content],
+                    "_title_only": False,
+                }
+            current_major["subevents"].append(current_subevent)
+            if not current_subevent["_title_only"]:
+                current_subevent = None
+            continue
+
+        line = strip_journal_markers(token_value)
+        if current_subevent:
+            current_subevent["_lines"].append(line)
+        elif current_major:
+            current_major["_lines"].append(line)
+        else:
+            intro_lines.append(line)
+
+    for major in major_events:
+        major["text"] = clean_journal_text(major.pop("_lines"))
+        for subevent in major["subevents"]:
+            subevent["text"] = clean_journal_text(subevent.pop("_lines"))
+            if not subevent["text"]:
+                subevent["text"] = subevent["title"]
+            subevent.pop("_title_only", None)
+
+    return {
+        "intro": clean_journal_text(intro_lines),
+        "major_events": major_events,
+        "parser_mode": "markers",
+    }
+
+
+def plain_journal_paragraphs(text: str):
+    normalized = normalize_user_text(text or "").replace("\r", "")
+    if re.search(r"\n\s*\n", normalized):
+        raw_paragraphs = re.split(r"\n\s*\n", normalized)
+        return [
+            " ".join(line.strip() for line in part.splitlines() if line.strip())
+            for part in raw_paragraphs
+            if part.strip()
+        ]
+    return [line.strip() for line in normalized.splitlines() if line.strip()]
+
+
+def is_chronology_heading(text: str) -> bool:
+    compact = " ".join(strip_journal_markers(text).split())
+    if len(compact) > 160 or not YEAR_PATTERN.search(compact):
+        return False
+    if re.fullmatch(
+        r"(?:1\d{3}|20\d{2})(?:\s*-\s*(?:1\d{3}|20\d{2}))?"
+        r"(?:\s+(?:год|года))?[.:]?",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    if re.match(r"^(?:1\d{3}|20\d{2})\s*-", compact):
+        return True
+    if re.search(
+        r"\((?:1\d{3}|20\d{2})\s*-\s*(?:(?:1\d{3}|20\d{2})|н\.?\s*в\.?)\)\.?$",
+        compact,
+        flags=re.IGNORECASE,
+    ):
+        return True
+    return bool(
+        re.search(r"(?:1\d{3}|20\d{2})\s*-\s*(?:1\d{3}|20\d{2})", compact)
+        and len(compact) <= 120
+    )
+
+
+def is_plain_subheading(text: str, next_text: str) -> bool:
+    compact = " ".join(strip_journal_markers(text).split())
+    return (
+        bool(compact)
+        and len(compact) <= 120
+        and len(compact.split()) <= 16
+        and not is_chronology_heading(compact)
+        and (compact.endswith(":") or not compact.endswith((".", "!", "?")))
+        and len(next_text or "") >= 100
+    )
+
+
+def inline_marked_events(text: str):
+    events = []
+    used = set()
+    for match in re.finditer(r"\[([^\[\]]{8,2000})\]|\{([^{}]{8,2000})\}", text):
+        content = strip_journal_markers(match.group(1) or match.group(2) or "")
+        key = content.casefold()
+        if content and key not in used:
+            used.add(key)
+            events.append(
+                {
+                    "id": uuid4().hex[:12],
+                    "title": derive_event_title(content),
+                    "text": content,
+                }
+            )
+    return events
+
+
+def parse_plain_journal(text: str):
+    paragraphs = plain_journal_paragraphs(text)
+    if not paragraphs:
+        raise ValueError("В файле не нашлось текста")
+
+    major_indices = [
+        index
+        for index, paragraph in enumerate(paragraphs)
+        if is_chronology_heading(paragraph)
+    ]
+    if len(major_indices) > 1:
+        first_index = major_indices[0]
+        first_candidate = strip_journal_markers(
+            paragraphs[first_index]
+        ).casefold()
+        if first_index <= 1 and re.search(
+            r"\b(?:история|хроника)\b", first_candidate
+        ):
+            # Название документа вроде "История Нолании (1808-2062)" - это
+            # вступление, а не отдельное событие в меню.
+            major_indices = major_indices[1:]
+    intro = []
+    major_events = []
+    current_major = None
+    current_subevent = None
+
+    if not major_indices:
+        first = strip_journal_markers(paragraphs[0])
+        use_first_as_title = len(first) <= 160
+        current_major = {
+            "id": uuid4().hex[:12],
+            "title": first[:200] if use_first_as_title else "Основная хроника",
+            "_body": [],
+            "subevents": [],
+        }
+        major_events.append(current_major)
+        body_paragraphs = paragraphs[1:] if use_first_as_title else paragraphs
+        current_major["_body"].extend(body_paragraphs)
+    else:
+        first_major_index = major_indices[0]
+        intro.extend(paragraphs[:first_major_index])
+        for index in range(first_major_index, len(paragraphs)):
+            paragraph = paragraphs[index]
+            clean_paragraph = strip_journal_markers(paragraph)
+            if is_chronology_heading(paragraph):
+                current_major = {
+                    "id": uuid4().hex[:12],
+                    "title": clean_paragraph[:200],
+                    "_body": [],
+                    "subevents": [],
+                }
+                major_events.append(current_major)
+                current_subevent = None
+                continue
+            if not current_major:
+                intro.append(clean_paragraph)
+                continue
+            next_text = (
+                paragraphs[index + 1] if index + 1 < len(paragraphs) else ""
+            )
+            if is_plain_subheading(paragraph, next_text):
+                current_subevent = {
+                    "id": uuid4().hex[:12],
+                    "title": clean_paragraph[:200],
+                    "_lines": [],
+                }
+                current_major["subevents"].append(current_subevent)
+                continue
+            if current_subevent:
+                current_subevent["_lines"].append(clean_paragraph)
+            else:
+                current_major["_body"].append(paragraph)
+
+    for major in major_events:
+        body_paragraphs = major.pop("_body")
+        clean_body = [strip_journal_markers(item) for item in body_paragraphs]
+        major["text"] = clean_journal_text(clean_body)
+        for subevent in major["subevents"]:
+            subevent["text"] = clean_journal_text(subevent.pop("_lines"))
+            if not subevent["text"]:
+                subevent["text"] = subevent["title"]
+
+        if not major["subevents"]:
+            for paragraph in body_paragraphs:
+                major["subevents"].extend(inline_marked_events(paragraph))
+        if not major["subevents"] and (
+            len(body_paragraphs) > 1 or len(major_events) == 1
+        ):
+            for paragraph in clean_body:
+                if len(paragraph) < 30:
+                    continue
+                major["subevents"].append(
+                    {
+                        "id": uuid4().hex[:12],
+                        "title": derive_event_title(paragraph),
+                        "text": paragraph,
+                    }
+                )
+
+    return {
+        "intro": clean_journal_text(
+            [strip_journal_markers(item) for item in intro]
+        ),
+        "major_events": major_events,
+        "parser_mode": "automatic",
+    }
+
+
+def parse_event_journal_text(text: str):
+    tokens = tokenize_structured_journal(text)
+    if any(token_type == "major" for token_type, _ in tokens):
+        parsed = parse_structured_journal(tokens)
+    else:
+        parsed = parse_plain_journal(text)
+
+    major_events = parsed["major_events"]
+    if not major_events:
+        raise ValueError("Не получилось выделить большие события")
+    if len(major_events) > 200:
+        raise ValueError("В одном файле можно сохранить максимум 200 больших событий")
+    subevents_count = sum(
+        len(major.get("subevents", [])) for major in major_events
+    )
+    if subevents_count > 2000:
+        raise ValueError("В одном файле можно сохранить максимум 2000 подсобытий")
+    return parsed
+
+
+def short_button_text(text: str, limit=58) -> str:
+    text = " ".join((text or "").split())
+    return text if len(text) <= limit else f"{text[:limit - 3]}..."
+
+
+def find_event_history(country: dict, history_id: str):
+    if not country:
+        return None
+    return next(
+        (
+            history
+            for history in country.get("event_histories", [])
+            if history.get("id") == history_id
+        ),
+        None,
+    )
+
+
+def find_major_event(history: dict, major_id: str):
+    if not history:
+        return None
+    return next(
+        (
+            event
+            for event in history.get("major_events", [])
+            if event.get("id") == major_id
+        ),
+        None,
+    )
+
+
+def find_subevent(major_event: dict, subevent_id: str):
+    if not major_event:
+        return None
+    return next(
+        (
+            event
+            for event in major_event.get("subevents", [])
+            if event.get("id") == subevent_id
+        ),
+        None,
+    )
+
+
+def journal_countries_page_keyboard(page=0):
+    countries = sorted(
+        [
+            (name, country)
+            for name, country in DATA.get("countries", {}).items()
+            if country.get("event_histories")
+        ],
+        key=lambda item: item[0].casefold(),
+    )
+    page_countries, page, total_pages = paginate_items(countries, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                name,
+                callback_data=f"journalcountry:{country['id']}",
+            )
+        ]
+        for name, country in page_countries
+    ]
+    navigation = pagination_row(page, total_pages, "journalpage")
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="mainmenu")]
+    )
+    keyboard = InlineKeyboardMarkup(buttons) if page_countries else None
+    return keyboard, page, total_pages
+
+
+def journal_histories_page_keyboard(country: dict, page=0):
+    histories = country.get("event_histories", []) if country else []
+    page_histories, page, total_pages = paginate_items(histories, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                short_button_text(history["title"]),
+                callback_data=(
+                    f"journalhistory:{country['id']}:{history['id']}"
+                ),
+            )
+        ]
+        for history in page_histories
+    ]
+    navigation = pagination_row(
+        page, total_pages, f"journalcpage:{country['id']}"
+    )
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ К странам", callback_data="journalpage:0"
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(buttons), page, total_pages
+
+
+def journal_major_events_page_keyboard(country: dict, history: dict, page=0):
+    events = history.get("major_events", []) if history else []
+    page_events, page, total_pages = paginate_items(events, page)
+    buttons = [
+        [
+            InlineKeyboardButton(
+                short_button_text(event["title"]),
+                callback_data=(
+                    f"journalmajor:{country['id']}:{history['id']}:{event['id']}"
+                ),
+            )
+        ]
+        for event in page_events
+    ]
+    navigation = pagination_row(
+        page,
+        total_pages,
+        f"journalhpage:{country['id']}:{history['id']}",
+    )
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ К историям",
+                callback_data=f"journalcountry:{country['id']}",
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(buttons), page, total_pages
+
+
+def journal_subevents_page_keyboard(
+    country: dict, history: dict, major_event: dict, page=0
+):
+    subevents = major_event.get("subevents", []) if major_event else []
+    page_events, page, total_pages = paginate_items(subevents, page)
+    buttons = []
+    if major_event.get("text"):
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    "📖 Текст большого события",
+                    callback_data=(
+                        f"journalmajortext:{country['id']}:{history['id']}:"
+                        f"{major_event['id']}"
+                    ),
+                )
+            ]
+        )
+    buttons.extend([
+        [
+            InlineKeyboardButton(
+                short_button_text(event["title"]),
+                callback_data=(
+                    f"journalsub:{country['id']}:{history['id']}:"
+                    f"{major_event['id']}:{event['id']}"
+                ),
+            )
+        ]
+        for event in page_events
+    ])
+    navigation = pagination_row(
+        page,
+        total_pages,
+        (
+            f"journalmpage:{country['id']}:{history['id']}:"
+            f"{major_event['id']}"
+        ),
+    )
+    if navigation:
+        buttons.append(navigation)
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                "⬅️ К большим событиям",
+                callback_data=(
+                    f"journalhistory:{country['id']}:{history['id']}"
+                ),
+            )
+        ]
+    )
+    return InlineKeyboardMarkup(buttons), page, total_pages
+
+
 def countries_keyboard(prefix="country", use_ids=False):
     names = sorted(DATA["countries"].keys())
     buttons = []
@@ -413,6 +1206,32 @@ def countries_page_keyboard(page=0):
     if navigation:
         buttons.append(navigation)
     keyboard = InlineKeyboardMarkup(buttons) if page_names else None
+    return keyboard, page, total_pages
+
+
+def country_selection_page_keyboard(
+    item_prefix: str, navigation_prefix: str, page=0
+):
+    countries = sorted(DATA["countries"].items(), key=lambda item: item[0].casefold())
+    page_countries, page, total_pages = paginate_items(countries, page)
+    buttons = []
+    row = []
+    for index, (name, country) in enumerate(page_countries, start=1):
+        row.append(
+            InlineKeyboardButton(
+                name,
+                callback_data=f"{item_prefix}:{country['id']}",
+            )
+        )
+        if index % 2 == 0:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+    navigation = pagination_row(page, total_pages, navigation_prefix)
+    if navigation:
+        buttons.append(navigation)
+    keyboard = InlineKeyboardMarkup(buttons) if page_countries else None
     return keyboard, page, total_pages
 
 
@@ -1014,8 +1833,25 @@ def library_flag_preview_keyboard(entry: dict, download_text: str):
     return InlineKeyboardMarkup(rows)
 
 
+def build_lore_links(lore_links) -> str:
+    links = []
+    for index, raw_url in enumerate(lore_links or [], start=1):
+        url = str(raw_url).strip()
+        if not url:
+            continue
+        label = "открыть" if len(lore_links) == 1 else f"ссылка {index}"
+        if url.casefold().startswith(("https://", "http://")):
+            links.append(f'<a href="{escape(url)}">{label}</a>')
+        else:
+            links.append(escape(url))
+    return ", ".join(links) if links else "-"
+
+
 def build_info_text(c: dict) -> str:
     continents = ", ".join(c.get("continents", []))
+    borders = ", ".join(c.get("borders", []))
+    area = c.get("area_km2") or ""
+    area_text = f"{area} км²" if area else "-"
     region_names = "\n\n".join(
         (
             f"{region['name']} ({region['capital']})"
@@ -1026,17 +1862,18 @@ def build_info_text(c: dict) -> str:
             c.get("regions", []), key=lambda item: item["name"].casefold()
         )
     )
-    lore = c.get("lore_links", [])
-    lore_text = "\n\n".join(lore) if lore else "-"
+    lore_text = build_lore_links(c.get("lore_links", []))
     text = (
         f"<b>{escape(c['name'])}</b>\n\n"
         f"<b>Кто у руля:</b> {escape(c.get('leader', '-'))}\n"
         f"Столица: {escape(c.get('capital', '-'))}\n"
-        f"Где находится: {escape(continents or '-')}\n\n"
+        f"Где находится: {escape(continents or '-')}\n"
+        f"Площадь: {escape(area_text)}\n"
+        f"Граничит с: {escape(borders or '-')}\n\n"
         f"<b>Регионы:</b>\n{escape(region_names or '-')}\n\n"
         f"<b>Немного о стране:</b>\n"
         f"<blockquote expandable>{escape(c.get('description') or '-')}</blockquote>\n\n"
-        f"Почитать лор:\n{escape(lore_text)}"
+        f"Почитать лор: {lore_text}"
     )
     return text
 
@@ -1079,7 +1916,36 @@ def info_buttons(c: dict):
                 )
             ]
         )
+    if c.get("event_histories"):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "📜 Журнал событий",
+                    callback_data=f"journalcountry:{c['id']}",
+                )
+            ]
+        )
     return InlineKeyboardMarkup(rows)
+
+
+def start_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📋 Список стран", callback_data="list_countries")],
+            [InlineKeyboardButton("🔎 Поиск страны", callback_data="search_countries")],
+            [InlineKeyboardButton("📜 Журнал событий", callback_data="journal")],
+            [InlineKeyboardButton("Библиотека флагов", callback_data="list_library_flags")],
+        ]
+    )
+
+
+def start_message_text():
+    return (
+        "Привет! Это бот-путеводитель по Аурелии\n\n"
+        "Тут можно полистать страны, посмотреть их флаги, гербы, регионы, "
+        "лор и журнал событий. Жми кнопку ниже и выбирай, куда заглянем\n\n"
+        f'v: "{BOT_VERSION}"'
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1087,19 +1953,18 @@ def info_buttons(c: dict):
 # ---------------------------------------------------------------------------
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup(
-        [
-            [InlineKeyboardButton("📋 Список стран", callback_data="list_countries")],
-            [InlineKeyboardButton("🔎 Поиск страны", callback_data="search_countries")],
-            [InlineKeyboardButton("Библиотека флагов", callback_data="list_library_flags")],
-        ]
-    )
     await update.message.reply_text(
-        "Привет! Это бот-путеводитель по Аурелии\n\n"
-        "Тут можно полистать страны, посмотреть их флаги, гербы, регионы и лор. "
-        "Жми кнопку ниже и выбирай, куда заглянем\n\n"
-        f'v: "{BOT_VERSION}"',
-        reply_markup=kb,
+        start_message_text(),
+        reply_markup=start_keyboard(),
+    )
+
+
+async def cb_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        start_message_text(),
+        reply_markup=start_keyboard(),
     )
 
 
@@ -1138,6 +2003,345 @@ async def cb_countries_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.edit_message_text(
         paginated_list_text("Выбирай страну:", page, total_pages),
         reply_markup=kb,
+    )
+
+
+def journal_menu_excerpt(text: str, limit=1000) -> str:
+    text = (text or "").strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = f"{text[:limit - 3].rstrip()}..."
+    return f"\n\n<blockquote expandable>{escape(text)}</blockquote>"
+
+
+def split_text_for_html(text: str, max_html_length=3000):
+    remaining = (text or "-").strip() or "-"
+    chunks = []
+    while remaining:
+        low = 1
+        high = min(len(remaining), max_html_length)
+        best = 1
+        while low <= high:
+            middle = (low + high) // 2
+            if len(escape(remaining[:middle])) <= max_html_length:
+                best = middle
+                low = middle + 1
+            else:
+                high = middle - 1
+        split_at = best
+        if split_at < len(remaining):
+            newline_at = remaining.rfind("\n", 0, split_at)
+            space_at = remaining.rfind(" ", 0, split_at)
+            natural_split = max(newline_at, space_at)
+            if natural_split >= split_at // 2:
+                split_at = natural_split
+        chunk = remaining[:split_at].strip()
+        if chunk:
+            chunks.append(chunk)
+        remaining = remaining[split_at:].lstrip()
+    return chunks or ["-"]
+
+
+async def send_journal_detail(
+    message,
+    title: str,
+    text: str,
+    back_text: str,
+    back_callback: str,
+):
+    chunks = split_text_for_html(text)
+    for index, chunk in enumerate(chunks):
+        heading = f"<b>{escape(title)}</b>\n\n" if index == 0 else ""
+        reply_markup = None
+        if index == len(chunks) - 1:
+            reply_markup = InlineKeyboardMarkup(
+                [[InlineKeyboardButton(back_text, callback_data=back_callback)]]
+            )
+        await message.reply_text(
+            f"{heading}{escape(chunk)}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=reply_markup,
+        )
+
+
+async def cmd_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    kb, page, total_pages = journal_countries_page_keyboard()
+    if not kb:
+        await update.message.reply_text(
+            "Журнал пока пустой - ни одной истории ещё не загрузили"
+        )
+        return
+    await update.message.reply_text(
+        paginated_list_text(
+            "Выбирай страну, чью историю хочешь открыть:",
+            page,
+            total_pages,
+        ),
+        reply_markup=kb,
+    )
+
+
+async def cb_journal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    kb, page, total_pages = journal_countries_page_keyboard()
+    if not kb:
+        await query.edit_message_text(
+            "Журнал пока пустой - ни одной истории ещё не загрузили",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ Назад в меню", callback_data="mainmenu")]]
+            ),
+        )
+        return
+    await query.edit_message_text(
+        paginated_list_text(
+            "Выбирай страну, чью историю хочешь открыть:",
+            page,
+            total_pages,
+        ),
+        reply_markup=kb,
+    )
+
+
+async def cb_journal_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.rsplit(":", 1)[1])
+    kb, page, total_pages = journal_countries_page_keyboard(page)
+    if not kb:
+        await query.edit_message_text(
+            "Журнал пока пустой - ни одной истории ещё не загрузили"
+        )
+        return
+    await query.edit_message_text(
+        paginated_list_text(
+            "Выбирай страну, чью историю хочешь открыть:",
+            page,
+            total_pages,
+        ),
+        reply_markup=kb,
+    )
+
+
+async def show_journal_country(query, country_id: str, page=0):
+    country_name, country = get_country_by_id(country_id)
+    if not country or not country.get("event_histories"):
+        await query.edit_message_text(
+            "Похоже, у этой страны больше нет загруженных историй",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ К странам", callback_data="journalpage:0")]]
+            ),
+        )
+        return
+    kb, page, total_pages = journal_histories_page_keyboard(country, page)
+    await query.edit_message_text(
+        paginated_list_text(
+            f'<b>Журнал событий - {escape(country_name)}</b>\n\nВыбирай историю:',
+            page,
+            total_pages,
+        ),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def cb_journal_country(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    country_id = query.data.split(":", 1)[1]
+    await show_journal_country(query, country_id)
+
+
+async def cb_journal_country_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, raw_page = query.data.split(":", 2)
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        await query.edit_message_text("Эта кнопка почему-то сломалась")
+        return
+    await show_journal_country(query, country_id, page)
+
+
+async def show_journal_history(
+    query, country_id: str, history_id: str, page=0
+):
+    country_name, country = get_country_by_id(country_id)
+    history = find_event_history(country, history_id)
+    if not country or not history:
+        await query.edit_message_text(
+            "Похоже, этой истории больше нет",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ К странам", callback_data="journalpage:0")]]
+            ),
+        )
+        return
+    kb, page, total_pages = journal_major_events_page_keyboard(
+        country, history, page
+    )
+    text = (
+        f"<b>{escape(history['title'])}</b>\n"
+        f"Страна: {escape(country_name)}"
+        f"{journal_menu_excerpt(history.get('intro'))}\n\n"
+        "Выбирай большое событие:"
+    )
+    await query.edit_message_text(
+        paginated_list_text(text, page, total_pages),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def cb_journal_history(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, history_id = query.data.split(":", 2)
+    except ValueError:
+        await query.edit_message_text("Эта кнопка почему-то сломалась")
+        return
+    await show_journal_history(query, country_id, history_id)
+
+
+async def cb_journal_history_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, history_id, raw_page = query.data.split(":", 3)
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        await query.edit_message_text("Эта кнопка почему-то сломалась")
+        return
+    await show_journal_history(query, country_id, history_id, page)
+
+
+async def show_journal_major_event(
+    query, country_id: str, history_id: str, major_id: str, page=0
+):
+    _, country = get_country_by_id(country_id)
+    history = find_event_history(country, history_id)
+    major_event = find_major_event(history, major_id)
+    if not country or not history or not major_event:
+        await query.edit_message_text(
+            "Похоже, этого события больше нет",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("⬅️ К странам", callback_data="journalpage:0")]]
+            ),
+        )
+        return
+
+    if not major_event.get("subevents"):
+        await send_journal_detail(
+            query.message,
+            major_event["title"],
+            major_event.get("text") or "У этого события пока нет отдельного описания",
+            "⬅️ К большим событиям",
+            f"journalhistory:{country_id}:{history_id}",
+        )
+        return
+
+    kb, page, total_pages = journal_subevents_page_keyboard(
+        country, history, major_event, page
+    )
+    text = (
+        f"<b>{escape(major_event['title'])}</b>"
+        f"{journal_menu_excerpt(major_event.get('text'))}\n\n"
+        "Выбирай подсобытие:"
+    )
+    await query.edit_message_text(
+        paginated_list_text(text, page, total_pages),
+        parse_mode=ParseMode.HTML,
+        reply_markup=kb,
+    )
+
+
+async def cb_journal_major(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, history_id, major_id = query.data.split(":", 3)
+    except ValueError:
+        await query.edit_message_text("Эта кнопка почему-то сломалась")
+        return
+    await show_journal_major_event(
+        query, country_id, history_id, major_id
+    )
+
+
+async def cb_journal_major_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, history_id, major_id, raw_page = query.data.split(
+            ":", 4
+        )
+        page = int(raw_page)
+    except (TypeError, ValueError):
+        await query.edit_message_text("Эта кнопка почему-то сломалась")
+        return
+    await show_journal_major_event(
+        query, country_id, history_id, major_id, page
+    )
+
+
+async def cb_journal_major_text(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, history_id, major_id = query.data.split(":", 3)
+    except ValueError:
+        await query.message.reply_text("Эта кнопка почему-то сломалась")
+        return
+    _, country = get_country_by_id(country_id)
+    history = find_event_history(country, history_id)
+    major_event = find_major_event(history, major_id)
+    if not country or not history or not major_event:
+        await query.message.reply_text("Похоже, этого события больше нет")
+        return
+    await send_journal_detail(
+        query.message,
+        major_event["title"],
+        major_event.get("text") or "У этого события пока нет отдельного описания",
+        "⬅️ К подсобытиям",
+        f"journalmajor:{country_id}:{history_id}:{major_id}",
+    )
+
+
+async def cb_journal_subevent(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    try:
+        _, country_id, history_id, major_id, subevent_id = query.data.split(
+            ":", 4
+        )
+    except ValueError:
+        await query.message.reply_text("Эта кнопка почему-то сломалась")
+        return
+    _, country = get_country_by_id(country_id)
+    history = find_event_history(country, history_id)
+    major_event = find_major_event(history, major_id)
+    subevent = find_subevent(major_event, subevent_id)
+    if not country or not history or not major_event or not subevent:
+        await query.message.reply_text("Похоже, этого подсобытия больше нет")
+        return
+    await send_journal_detail(
+        query.message,
+        subevent["title"],
+        subevent.get("text") or "У этого подсобытия пока нет отдельного описания",
+        "⬅️ К подсобытиям",
+        f"journalmajor:{country_id}:{history_id}:{major_id}",
     )
 
 
@@ -1583,6 +2787,7 @@ async def cmd_admhelp(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/editcountry - отредактировать существующую страну\n"
         "/addregion - добавить регион\n"
         "/editregion - изменить или удалить регион\n"
+        "/addhistory - загрузить историю DOCX, TXT, MD или PDF в журнал\n"
         "/addflag - добавить флаг страны или региона\n"
         "/editflag - изменить или удалить флаг из библиотеки\n"
         "Также можно просто отправить флаг файлом и написать страну в подписи\n"
@@ -1643,7 +2848,11 @@ def database_counts(data: dict):
         for country in data.get("countries", {}).values()
     )
     flags_count = len(data.get("flag_library", []))
-    return countries_count, regions_count, flags_count
+    histories_count = sum(
+        len(country.get("event_histories", []))
+        for country in data.get("countries", {}).values()
+    )
+    return countries_count, regions_count, flags_count, histories_count
 
 
 def clear_restore_context(context: ContextTypes.DEFAULT_TYPE):
@@ -1666,14 +2875,15 @@ async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Не-а, эта команда только для админов")
         return
 
-    countries_count, regions_count, flags_count = database_counts(DATA)
+    countries_count, regions_count, flags_count, histories_count = database_counts(DATA)
     await send_database_backup(
         update.message,
         (
             "Готово, вот свежая резервная копия\n\n"
             f"Стран: {countries_count}\n"
             f"Регионов: {regions_count}\n"
-            f"Флагов: {flags_count}"
+            f"Флагов: {flags_count}\n"
+            f"Историй: {histories_count}"
         ),
     )
 
@@ -1715,7 +2925,9 @@ async def restore_backup_file(
         )
         return RESTORE_BACKUP_FILE
 
-    countries_count, regions_count, flags_count = database_counts(restored_data)
+    countries_count, regions_count, flags_count, histories_count = database_counts(
+        restored_data
+    )
     context.user_data["restore_backup_data"] = restored_data
     buttons = [[
         InlineKeyboardButton("Восстановить", callback_data="restorebackup:yes"),
@@ -1725,7 +2937,8 @@ async def restore_backup_file(
         "Копия выглядит нормально\n\n"
         f"Стран: {countries_count}\n"
         f"Регионов: {regions_count}\n"
-        f"Флагов: {flags_count}\n\n"
+        f"Флагов: {flags_count}\n"
+        f"Историй: {histories_count}\n\n"
         "Заменяем текущую базу?",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -1767,14 +2980,195 @@ async def restore_backup_confirm(
     DATA.update(restored_data)
     sync_entity_flags_to_library()
     save_data()
-    countries_count, regions_count, flags_count = database_counts(DATA)
+    countries_count, regions_count, flags_count, histories_count = database_counts(DATA)
     clear_restore_context(context)
     await query.edit_message_text(
         "Готово, базу восстановил\n\n"
         f"Стран: {countries_count}\n"
         f"Регионов: {regions_count}\n"
-        f"Флагов: {flags_count}"
+        f"Флагов: {flags_count}\n"
+        f"Историй: {histories_count}"
     )
+    return ConversationHandler.END
+
+
+# ---------------------------------------------------------------------------
+# Загрузка истории для журнала событий
+# ---------------------------------------------------------------------------
+
+def clear_history_context(context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("history_country_id", None)
+
+
+async def add_history_start(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("Не-а, эта команда только для админов")
+        return ConversationHandler.END
+    if not DATA.get("countries"):
+        await update.message.reply_text(
+            "Сначала нужна хотя бы одна страна - добавь её через /addcountry"
+        )
+        return ConversationHandler.END
+
+    clear_history_context(context)
+    kb, page, total_pages = country_selection_page_keyboard(
+        "addhistorycountry", "addhistorypage"
+    )
+    await update.message.reply_text(
+        paginated_list_text(
+            "К какой стране добавить историю?", page, total_pages
+        ),
+        reply_markup=kb,
+    )
+    return ADD_HISTORY_CHOOSE_COUNTRY
+
+
+async def add_history_country_page(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    page = int(query.data.rsplit(":", 1)[1])
+    kb, page, total_pages = country_selection_page_keyboard(
+        "addhistorycountry", "addhistorypage", page
+    )
+    await query.edit_message_text(
+        paginated_list_text(
+            "К какой стране добавить историю?", page, total_pages
+        ),
+        reply_markup=kb,
+    )
+    return ADD_HISTORY_CHOOSE_COUNTRY
+
+
+async def add_history_choose_country(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+    country_id = query.data.split(":", 1)[1]
+    country_name, country = get_country_by_id(country_id)
+    if not country:
+        await query.message.reply_text("Похоже, этой страны уже нет")
+        clear_history_context(context)
+        return ConversationHandler.END
+
+    context.user_data["history_country_id"] = country_id
+    await query.message.reply_text(
+        f'Скинь историю страны "{country_name}" файлом DOCX, TXT, MD или PDF\n\n'
+        "Название файла станет названием истории\n\n"
+        "Если [] и {} уже расставлены, бот использует их\n"
+        "Если скобок нет, попробует сам найти даты и заголовки\n\n"
+        "[] - большое событие\n"
+        "{} - подсобытие, внутри может быть название или весь текст\n\n"
+        "[Большое событие]\n"
+        "Текст большого события\n\n"
+        "{Дата - подсобытие}\n"
+        "Текст подсобытия"
+    )
+    return ADD_HISTORY_FILE
+
+
+async def add_history_file(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    country_id = context.user_data.get("history_country_id")
+    country_name, country = get_country_by_id(country_id)
+    if not country:
+        await update.message.reply_text(
+            "Страна куда-то пропала - запусти /addhistory заново"
+        )
+        clear_history_context(context)
+        return ConversationHandler.END
+
+    document = update.message.document
+    if not document:
+        await update.message.reply_text("Нужен файл DOCX, TXT, MD или PDF")
+        return ADD_HISTORY_FILE
+    filename = normalize_user_text(document.file_name or "history.txt")
+    extension = os.path.splitext(filename)[1].casefold()
+    if extension not in (".docx", ".txt", ".md", ".pdf"):
+        await update.message.reply_text(
+            "Поддерживаются файлы DOCX, TXT, MD и PDF"
+        )
+        return ADD_HISTORY_FILE
+    if document.file_size and document.file_size > 20 * 1024 * 1024:
+        await update.message.reply_text("Файл тяжелее 20 МБ - возьми версию поменьше")
+        return ADD_HISTORY_FILE
+
+    title = normalize_user_text(os.path.splitext(os.path.basename(filename))[0])
+    title = title.replace("_", " ").strip(" -_")
+    title = re.sub(r"\s+\(\d+\)$", "", title).strip()
+    if not title:
+        await update.message.reply_text("У файла должно быть нормальное название")
+        return ADD_HISTORY_FILE
+    if len(title) > 100:
+        await update.message.reply_text(
+            "Название файла длиннее 100 символов - сначала переименуй его"
+        )
+        return ADD_HISTORY_FILE
+
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        payload = bytes(await telegram_file.download_as_bytearray())
+        source_text = extract_history_text(filename, payload)
+        parsed = parse_event_journal_text(source_text)
+    except Exception as error:
+        logger.warning("Не удалось разобрать историю %s: %s", filename, error)
+        await update.message.reply_text(
+            f"Не получилось разобрать эту историю\n\nПричина: {error}"
+        )
+        return ADD_HISTORY_FILE
+
+    histories = country.setdefault("event_histories", [])
+    existing_history = next(
+        (
+            history
+            for history in histories
+            if history.get("title", "").casefold() == title.casefold()
+        ),
+        None,
+    )
+    history = {
+        "id": (
+            existing_history["id"]
+            if existing_history
+            else uuid4().hex[:12]
+        ),
+        "title": title,
+        "intro": parsed["intro"],
+        "source_filename": filename,
+        "source_file_id": document.file_id,
+        "uploaded_at": datetime.now().isoformat(timespec="seconds"),
+        "parser_mode": parsed["parser_mode"],
+        "major_events": parsed["major_events"],
+    }
+    if existing_history:
+        histories[histories.index(existing_history)] = history
+        action = "обновил"
+    else:
+        histories.append(history)
+        action = "добавил"
+
+    save_data()
+    subevents_count = sum(
+        len(event.get("subevents", []))
+        for event in history["major_events"]
+    )
+    parser_label = (
+        "по [] и {}"
+        if parsed["parser_mode"] == "markers"
+        else "автоматически по датам и заголовкам"
+    )
+    await update.message.reply_text(
+        f'Готово! Историю "{title}" {action} для страны "{country_name}"\n\n'
+        f"Больших событий: {len(history['major_events'])}\n"
+        f"Подсобытий: {subevents_count}\n"
+        f"Разбор: {parser_label}"
+    )
+    clear_history_context(context)
     return ConversationHandler.END
 
 
@@ -1790,6 +3184,7 @@ async def add_country_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["new_country"] = {
         "id": uuid4().hex[:12],
         "regions": [],
+        "event_histories": [],
     }
     await update.message.reply_text(
         "Окей, добавляем новую страну. Для начала скинь её карточку картинкой"
@@ -1841,6 +3236,29 @@ async def add_continent(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raw = normalize_user_text(update.message.text.strip())
     continents = [c.strip() for c in raw.split(",") if c.strip()]
     context.user_data["new_country"]["continents"] = continents
+    await update.message.reply_text(
+        "Какая у страны площадь в км²? Напиши только число, например 2059580,3"
+    )
+    return ADD_AREA
+
+
+async def add_area(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        area = normalize_area_value(update.message.text)
+    except ValueError as error:
+        await update.message.reply_text(str(error))
+        return ADD_AREA
+    context.user_data["new_country"]["area_km2"] = area
+    await update.message.reply_text(
+        'С кем граничит страна? Перечисли через запятую или напиши "нет"'
+    )
+    return ADD_BORDERS
+
+
+async def add_borders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["new_country"]["borders"] = parse_borders_value(
+        update.message.text
+    )
     await update.message.reply_text(
         "Теперь выбери готовый флаг из библиотеки или загрузи новый",
         reply_markup=flag_choice_keyboard("addcountryflag"),
@@ -1990,6 +3408,29 @@ restore_backup_conv = ConversationHandler(
 )
 
 
+add_history_conv = ConversationHandler(
+    entry_points=[
+        CommandHandler(["addhistory", "addevents"], add_history_start)
+    ],
+    states={
+        ADD_HISTORY_CHOOSE_COUNTRY: [
+            CallbackQueryHandler(
+                add_history_choose_country,
+                pattern=r"^addhistorycountry:[^:]+$",
+            ),
+            CallbackQueryHandler(
+                add_history_country_page,
+                pattern=r"^addhistorypage:\d+$",
+            ),
+        ],
+        ADD_HISTORY_FILE: [
+            MessageHandler(filters.Document.ALL & ~filters.COMMAND, add_history_file)
+        ],
+    },
+    fallbacks=[CommandHandler("cancel", cancel)],
+)
+
+
 search_country_conv = ConversationHandler(
     entry_points=[
         CommandHandler("search", search_country_start),
@@ -2012,6 +3453,8 @@ add_country_conv = ConversationHandler(
         ADD_LEADER: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_leader)],
         ADD_CAPITAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_capital)],
         ADD_CONTINENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_continent)],
+        ADD_AREA: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_area)],
+        ADD_BORDERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, add_borders)],
         ADD_FLAG: [
             CallbackQueryHandler(
                 add_country_flag_choice, pattern=r"^addcountryflag:"
@@ -2081,6 +3524,8 @@ async def edit_choose_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "leader": "Кто теперь у неё лидер?",
         "capital": "Как теперь называется столица?",
         "continents": "Перечисли континенты через запятую:",
+        "area_km2": "Напиши новую площадь в км² только числом:",
+        "borders": 'Перечисли соседние страны через запятую или напиши "нет":',
         "card": "Скинь новую карточку картинкой:",
         "flag": "Скинь новый флаг. Лучше файлом, без сжатия:",
         "herb": "Скинь новый герб файлом или напиши \"нет\", если его больше нет:",
@@ -2128,8 +3573,27 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return EDIT_VALUE
 
     elif field == "continents":
+        if not update.message.text:
+            await update.message.reply_text("Континенты нужно прислать текстом")
+            return EDIT_VALUE
         raw = normalize_user_text(update.message.text.strip())
         c["continents"] = [x.strip() for x in raw.split(",") if x.strip()]
+
+    elif field == "area_km2":
+        if not update.message.text:
+            await update.message.reply_text("Площадь нужно прислать текстом")
+            return EDIT_VALUE
+        try:
+            c["area_km2"] = normalize_area_value(update.message.text)
+        except ValueError as error:
+            await update.message.reply_text(str(error))
+            return EDIT_VALUE
+
+    elif field == "borders":
+        if not update.message.text:
+            await update.message.reply_text("Границы нужно прислать текстом")
+            return EDIT_VALUE
+        c["borders"] = parse_borders_value(update.message.text)
 
     elif field == "lore_links":
         raw = normalize_user_text(update.message.text.strip())
@@ -2149,9 +3613,15 @@ async def edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if new_name != name and new_name in DATA["countries"]:
             await update.message.reply_text("Такое название уже занято. Давай другое")
             return EDIT_VALUE
+        old_name = name
         DATA["countries"].pop(name)
         c["name"] = new_name
         DATA["countries"][new_name] = c
+        for other_country in DATA["countries"].values():
+            other_country["borders"] = [
+                new_name if border.casefold() == old_name.casefold() else border
+                for border in other_country.get("borders", [])
+            ]
         name = new_name
 
     else:  # leader, capital
@@ -3339,6 +4809,7 @@ def public_commands():
         BotCommand("start", "Начать"),
         BotCommand("countries", "Список стран"),
         BotCommand("search", "Найти страну"),
+        BotCommand("journal", "Журнал событий"),
         BotCommand("flags", "Библиотека флагов"),
     ]
 
@@ -3349,6 +4820,7 @@ def admin_commands():
         BotCommand("editcountry", "Редактировать страну"),
         BotCommand("addregion", "Добавить регион"),
         BotCommand("editregion", "Изменить или удалить регион"),
+        BotCommand("addhistory", "Загрузить историю в журнал"),
         BotCommand("addflag", "Добавить флаг страны или региона"),
         BotCommand("editflag", "Изменить или удалить флаг"),
         BotCommand("backup", "Скачать резервную копию"),
@@ -3395,12 +4867,14 @@ def main():
 
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("countries", cmd_countries))
+    application.add_handler(CommandHandler("journal", cmd_journal))
     application.add_handler(CommandHandler("flags", cmd_flags))
     application.add_handler(CommandHandler("admhelp", cmd_admhelp))
     application.add_handler(CommandHandler("addadmin", cmd_addadmin))
     application.add_handler(CommandHandler("backup", cmd_backup))
 
     application.add_handler(restore_backup_conv)
+    application.add_handler(add_history_conv)
     application.add_handler(add_country_conv)
     application.add_handler(edit_country_conv)
     application.add_handler(search_country_conv)
@@ -3413,6 +4887,62 @@ def main():
     )
 
     application.add_handler(CallbackQueryHandler(cb_list_countries, pattern=r"^list_countries$"))
+    application.add_handler(
+        CallbackQueryHandler(cb_main_menu, pattern=r"^mainmenu$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cb_journal, pattern=r"^journal$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(cb_journal_page, pattern=r"^journalpage:\d+$")
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_country, pattern=r"^journalcountry:[^:]+$"
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_country_page,
+            pattern=r"^journalcpage:[^:]+:\d+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_history,
+            pattern=r"^journalhistory:[^:]+:[^:]+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_history_page,
+            pattern=r"^journalhpage:[^:]+:[^:]+:\d+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_major,
+            pattern=r"^journalmajor:[^:]+:[^:]+:[^:]+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_major_page,
+            pattern=r"^journalmpage:[^:]+:[^:]+:[^:]+:\d+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_major_text,
+            pattern=r"^journalmajortext:[^:]+:[^:]+:[^:]+$",
+        )
+    )
+    application.add_handler(
+        CallbackQueryHandler(
+            cb_journal_subevent,
+            pattern=r"^journalsub:[^:]+:[^:]+:[^:]+:[^:]+$",
+        )
+    )
     application.add_handler(
         CallbackQueryHandler(cb_countries_page, pattern=r"^countriespage:\d+$")
     )
